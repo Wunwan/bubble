@@ -20,6 +20,13 @@
     object-fit: cover;
     transform: scaleX(-1);
   }
+  /* WebGL bubble-surface layer between the video and the 2D overlay */
+  #gl {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
   /* Overlay canvas sits on top; we mirror coordinates in JS, not CSS */
   #overlay {
     position: fixed;
@@ -27,31 +34,9 @@
     width: 100%;
     height: 100%;
   }
-  /* Cinematic grade: a gentle lift on the whole scene (video + bubbles)… */
   #scene {
     position: fixed;
     inset: 0;
-    filter: saturate(1.12) contrast(1.05) brightness(1.03);
-  }
-  /* …a cool-shadow / warm-highlight wash… */
-  #tint {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    background: linear-gradient(160deg,
-      rgba(70, 150, 255, 0.22),
-      rgba(20, 30, 60, 0) 45%,
-      rgba(255, 168, 92, 0.18));
-    mix-blend-mode: soft-light;
-  }
-  /* …and a soft edge vignette to pull focus to the center */
-  #vignette {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    background: radial-gradient(ellipse at center,
-      transparent 52%,
-      rgba(4, 6, 14, 0.42) 100%);
   }
   #status {
     position: fixed;
@@ -73,10 +58,9 @@
 <body>
 <div id="scene">
   <video id="cam" autoplay playsinline muted></video>
+  <canvas id="gl"></canvas>
   <canvas id="overlay"></canvas>
 </div>
-<div id="tint"></div>
-<div id="vignette"></div>
 <div id="status">requesting camera…</div>
 
 <script type="module">
@@ -86,6 +70,8 @@ import { FilesetResolver, HandLandmarker } from
 const video = document.getElementById('cam');
 const canvas = document.getElementById('overlay');
 const ctx = canvas.getContext('2d');
+const glCanvas = document.getElementById('gl');
+const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true });
 const status = document.getElementById('status');
 
 const WRIST = 0;
@@ -100,7 +86,7 @@ const PINCH_END_RATIO   = 0.45; // pinch ends above this — gap vs START is hys
 
 // Inflation
 const SPAWN_RADIUS  = 14;  // px, bubble size the moment a pinch begins
-const MAX_RADIUS    = 90;  // px, inflation cap
+const MAX_RADIUS    = 180; // px, inflation cap — the biggest a bubble can grow
 const INFLATE_SPEED = 55;  // px of radius per second while the pinch is held
 
 // Popping: fingertip pops a bubble within radius × this.
@@ -117,15 +103,28 @@ const SNAP_WOBBLE_HZ = 6;    // release-wobble speed
 const SNAP_SETTLE    = 4;    // how fast the wobble dies out (per second)
 const NECK_TIME      = 0.12; // s the detaching neck stays visible
 
-// --- Look tuning -------------------------------------------------------
-const REFLECTION_OPACITY = 0.35; // fake lens reflection of the room inside the bubble
-const REFRACTION_ZOOM    = 1.18; // how much that reflection magnifies the scene
-const TINT_STRENGTH      = 0.07; // per-bubble pastel wash — keep whisper-faint
-const WIGGLE_AMOUNT      = 0.02; // outline ripple, as a fraction of radius
-const WIGGLE_SPEED_BOOST = 1.5;  // extra ripple when moving fast (air resistance)
+// --- Look tuning (WebGL soap-film shader) ------------------------------
+// Physics adapted from "Physically-Based Soap Bubble"
+// (https://www.shadertoy.com/view/XtKyRK by totimannino): spectral
+// thin-film interference, gravity-graded film thickness, micro-slosh —
+// with the webcam feed as the environment it reflects and refracts.
+const IRIDESCENCE_STRENGTH = 0.18; // 0 = clear glass … 1 = full rainbow film
+const REFRACTION_AMOUNT    = 0.22; // how strongly the film bends the scene behind it
+const INNER_REFLECTION     = 0.45; // opacity of the back-surface (inner) reflection layer
+const REFLECTION_CONTRAST  = 1.15; // punch of reflections/speculars + limb darkening (1 = flat)
+const SURFACE_WAVES        = 0.02; // micro-wave sloshing of the surface normal (0 = mirror-smooth)
+const CONTACT_SQUISH       = 0.6;  // how much touching bubbles flatten against each other
+                                   // (0 = pass through unchanged, 1 = fully flat shared wall)
+const FILM_THICKNESS_MIN   = 150;  // film nm at the top of the bubble…
+const FILM_THICKNESS_MAX   = 700;  // …thickening toward the bottom (gravity)
+const TINT_STRENGTH        = 0.03; // per-bubble pastel wash — keep whisper-faint
+const WIGGLE_AMOUNT        = 0.005; // outline ripple, fraction of radius — a whisper;
+                                    // real bubbles stay almost perfectly round
+const WIGGLE_SPEED_BOOST   = 0.6;   // extra ripple when moving fast (air resistance)
 
 // Pastel tints a bubble can be born with (hues; drawn whisper-faint)
 const TINT_HUES = [210, 48, 340, 150, 270]; // pale blue, butter, rose, mint, lavender
+const TINT_RGBS = TINT_HUES.map(h => hslToRgb(h / 360, 0.8, 0.8));
 
 function setStatus(msg, cls) {
   status.style.opacity = '1';
@@ -138,6 +137,8 @@ function resizeCanvas() {
   canvas.width = window.innerWidth * dpr;
   canvas.height = window.innerHeight * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  glCanvas.width = window.innerWidth * dpr;
+  glCanvas.height = window.innerHeight * dpr;
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
@@ -184,6 +185,460 @@ function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+function hslToRgb(h, s, l) {
+  const f = n => {
+    const k = (n + h * 12) % 12;
+    return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+// --- WebGL soap-film surface layer --------------------------------------
+// Each bubble is one quad; the fragment shader rebuilds the same wiggling,
+// snap-stretched outline the 2D renderer used (driven by uniforms), then
+// shades it as a physically-based soap film. Shadertoy's iResolution /
+// iTime / iChannel0 / iMouse are replaced by the uniforms below, and the
+// webcam video is the environment texture the film reflects and refracts.
+const QUAD_MARGIN = 1.4; // quad half-size in radii: headroom for wiggle + snap
+
+const VERT_SRC = `
+attribute vec2 aCorner;
+uniform vec2 uRes;
+uniform vec2 uCenter;   // device px, y measured down from the top
+uniform float uExtent;  // half-size of the quad in device px
+void main() {
+  vec2 px = uCenter + aCorner * uExtent;
+  gl_Position = vec4(px.x / uRes.x * 2.0 - 1.0, 1.0 - px.y / uRes.y * 2.0, 0.0, 1.0);
+}`;
+
+const FRAG_SRC = `
+precision highp float;
+uniform vec2  uRes;
+uniform float uTime;
+uniform sampler2D uEnv; // webcam frame
+uniform vec2  uEnvA;    // screen px -> video uv:  uv = px * uEnvA + uEnvB
+uniform vec2  uEnvB;    //   (encodes the cover crop and the selfie mirror)
+uniform vec2  uCenter;
+uniform float uRadius;
+uniform float uPhase;
+uniform float uWiggle;
+uniform float uStretch;
+uniform vec2  uAxis;    // (cos, sin) of the release axis
+uniform vec3  uTint;
+uniform float uTintStrength;
+uniform float uIrid;
+uniform float uRefract;
+uniform float uInnerRefl;
+uniform float uContrast;
+uniform float uWaves;
+uniform float uThickMin;
+uniform float uThickMax;
+uniform vec3  uSeed;        // per-bubble randomness (uniqueness)
+uniform float uSquish;      // contact-deformation strength
+uniform vec3  uContacts[3]; // xy: direction to neighbour, z: wall dist (radii)
+uniform int   uNumContacts;
+
+const float PI = 3.141592653589793;
+
+// ---- Ported from "Physically-Based Soap Bubble" by Matteo Mannino ----
+// https://www.shadertoy.com/view/XtKyRK (CC BY-NC 4.0). The spectral
+// filter below condenses an RGB->81-wavelength-spectrum->interference->
+// RGB pipeline into 13 Fourier terms (coefficients verbatim).
+const float R_0 = 0.0278;         // film reflectance at normal incidence
+const float NU  = 1.4;            // refractive index of the film
+const float VAR_FILMWIDTH = 20.0; // nm of micro-slosh width variation
+
+mat3 sparsespfiltconst;
+mat3 sparsespfilta[13];
+mat3 sparsespfiltb[13];
+
+void initialize_sparse_spectral_transforms() {
+  sparsespfiltconst = mat3(vec3(997.744490776777870, 0.0, 0.0), vec3(0.0, 1000.429230968840700, 0.0), vec3(0.0, 0.0, 1000.314923254210300));
+  sparsespfilta[0] = mat3(vec3(-9.173541963568921, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfilta[1] = mat3(vec3(-12.118820092848431, 0.0, 0.0), vec3(0.0, 0.362717643641774, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfilta[2] = mat3(vec3(-18.453733912103289, 0.0, 0.0), vec3(0.0, 1.063838675818334, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfilta[3] = mat3(vec3(-448.414255038845680, -26.846846493079958, 0.0), vec3(94.833575999184120, 9.525075729872752, 0.0), vec3(-48.773853498042200, 0.0, -0.416692876008104));
+  sparsespfilta[4] = mat3(vec3(6.312176276235818, -29.044711065580177, 0.0), vec3(-187.629408328884550, -359.908263134928520, 0.0), vec3(0.0, 25.579031651446712, -0.722360089703890));
+  sparsespfilta[5] = mat3(vec3(-33.547962219868452, 61.587972582979901, 0.0), vec3(97.565538879460178, -150.665614921761320, -30.220477643983013), vec3(1.552347379820659, -0.319166631512109, -0.935186347338915));
+  sparsespfilta[6] = mat3(vec3(3.894757056395064, 0.0, 10.573132007634964), vec3(0.0, -3.434367603334157, -9.216617325755173), vec3(39.438244799684632, 0.0, -274.009089525723140));
+  sparsespfilta[7] = mat3(vec3(3.824490469437192, 0.0, 0.0), vec3(0.0, -1.540065958710146, 35.179624268750139), vec3(0.0, 0.0, -239.475015979167920));
+  sparsespfilta[8] = mat3(vec3(2.977660826364815, 0.0, 0.0), vec3(0.0, -1.042036915995045, 0.0), vec3(0.0, 0.0, -2.472524681362817));
+  sparsespfilta[9] = mat3(vec3(2.307327051977537, 0.0, 0.0), vec3(0.0, -0.875061637866728, 0.0), vec3(0.0, 0.0, -1.409849313639845));
+  sparsespfilta[10] = mat3(vec3(1.823790655724537, 0.0, 0.0), vec3(0.0, -0.781918646414733, 0.0), vec3(0.0, 0.0, -1.048825978147449));
+  sparsespfilta[11] = mat3(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, -0.868933490490107));
+  sparsespfilta[12] = mat3(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, -0.766926116519291));
+  sparsespfiltb[0] = mat3(vec3(36.508697968439087, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfiltb[1] = mat3(vec3(57.242341893668829, 0.0, 0.0), vec3(0.0, 38.326477066948989, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfiltb[2] = mat3(vec3(112.305664332688050, 0.0, 0.0), vec3(0.0, 59.761768151790150, 0.0), vec3(0.0, 0.0, 0.0));
+  sparsespfiltb[3] = mat3(vec3(295.791838308625070, 58.489998502973329, 0.0), vec3(70.091833386311293, 120.512061156381040, 0.0), vec3(17.204619265336060, 0.0, 37.784871450121273));
+  sparsespfiltb[4] = mat3(vec3(-253.802681237032970, -160.471170139118780, 0.0), vec3(-194.893137314865900, 220.339388056683760, 0.0), vec3(0.0, -22.651202495658183, 57.335351084503102));
+  sparsespfiltb[5] = mat3(vec3(-114.597984116320400, 38.688618505605739, 0.0), vec3(30.320616033665370, -278.354607015268130, 9.944900164751438), vec3(-30.962164636838232, 37.612068254920686, 113.260728861048410));
+  sparsespfiltb[6] = mat3(vec3(-78.527368894236332, 0.0, 30.382451414099631), vec3(0.0, -116.269817575252430, -55.801473552703627), vec3(0.353768568406928, 0.0, 243.785483416097240));
+  sparsespfiltb[7] = mat3(vec3(-53.536668214025610, 0.0, 0.0), vec3(0.0, -68.933243211639621, 17.821880498324404), vec3(0.0, 0.0, -278.470203722289060));
+  sparsespfiltb[8] = mat3(vec3(-42.646930307293360, 0.0, 0.0), vec3(0.0, -51.026918452773138, 0.0), vec3(0.0, 0.0, -113.420624636770270));
+  sparsespfiltb[9] = mat3(vec3(-35.705990828985080, 0.0, 0.0), vec3(0.0, -40.934269625438475, 0.0), vec3(0.0, 0.0, -67.307342271105213));
+  sparsespfiltb[10] = mat3(vec3(-30.901151041566411, 0.0, 0.0), vec3(0.0, -34.440424768095276, 0.0), vec3(0.0, 0.0, -49.156471643386766));
+  sparsespfiltb[11] = mat3(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, -39.178407337105710));
+  sparsespfiltb[12] = mat3(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, -32.812895526130347));
+}
+
+// The film's spectral BRDF: attenuates an environment colour by the
+// thin-film interference for this film width and incident angle.
+vec3 sp_spectral_filter(vec3 col, float filmwidth, float cosi) {
+  const float NN = 2001.0;
+  float a = 1.0 / (NU * NU);
+  float cost = sqrt(a * cosi * cosi + (1.0 - a));
+  float n = 2.0 * PI * filmwidth * cost / NN;
+  mat3 filt = sparsespfiltconst;
+  for (int i = 0; i < 13; i++) {
+    float kn = (float(i) + 6.0) * n;
+    filt += sparsespfilta[i] * cos(kn) + sparsespfiltb[i] * sin(kn);
+  }
+  return 4.0 * (filt * col) / NN;
+}
+
+// Fake-HDR lift (from the original) so bright parts of the webcam bloom
+vec3 fakehdr(vec3 c) {
+  c = pow(c, vec3(2.2));
+  float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  return (exp(0.8 * lum) - 1.0) * c;
+}
+
+// Procedural stand-in for the original's noise texture (iChannel1)
+float hash13(vec3 p) {
+  return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+float vnoise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(i);
+  float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+  float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+  float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+  float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+  float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+  float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+  float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+  return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+             mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+float fBm(vec3 p) {
+  return 4.0 * vnoise(p) + 2.0 * vnoise(2.0 * p);
+}
+// One level of warp noise for the micro waves on the film surface
+float warpnoise3(vec3 p) {
+  const float tc = 0.05;
+  vec3 q = vec3(fBm(p + tc * uTime),
+                fBm(p + vec3(5.1, 1.3, 2.2) + tc * uTime),
+                fBm(p + vec3(3.4, 4.8, 5.5) + tc * uTime));
+  return 1.2 * fBm(p + 0.06 * q);
+}
+
+vec2 envUV(vec2 px) {
+  return clamp(px * uEnvA + uEnvB, 0.0, 1.0);
+}
+
+void main() {
+  initialize_sparse_spectral_transforms();
+  vec2 frag = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y); // y-down px
+  vec2 p = (frag - uCenter) / uRadius;                       // radii units
+
+  // Undo the pinch-off stretch to get circle space
+  vec2 pr = vec2( p.x * uAxis.x + p.y * uAxis.y,
+                 -p.x * uAxis.y + p.y * uAxis.x);
+  pr /= vec2(1.0 + uStretch, 1.0 - 0.6 * uStretch);
+
+  // Surface-tension ripple, identical maths to the old 2D outline
+  float th = atan(pr.y, pr.x);
+  float ripple = 1.0 + uWiggle * sin(3.0 * th + uTime * 1.8 + uPhase)
+                     + uWiggle * 0.6 * sin(5.0 * th - uTime * 2.6 + uPhase * 2.0);
+  float rr = length(pr) / ripple;
+
+  // Bubble-to-bubble contact: each touching neighbour defines a shared
+  // wall plane; the outline is pressed flat against it (surface tension)
+  // while the bubble keeps its own centre and identity. uSquish blends
+  // between untouched (0) and a fully flat shared wall (1).
+  float rrBase = rr;
+  vec2 ndir = pr / max(length(pr), 1e-4);
+  for (int k = 0; k < 3; k++) {
+    if (k < uNumContacts) {
+      vec3 c = uContacts[k];
+      float wallv = dot(pr, c.xy) / c.z;
+      float pressed = mix(rrBase, wallv, uSquish);
+      if (pressed > rr) {
+        // near the wall the surface normal turns to face the neighbour
+        ndir = normalize(mix(ndir, c.xy, uSquish * clamp(4.0 * (wallv - rrBase), 0.0, 1.0)));
+        rr = pressed;
+      }
+    }
+  }
+
+  float aa = 2.5 / uRadius;                     // feathered edge band
+  float mask = 1.0 - smoothstep(1.0 - aa, 1.0, rr);
+  if (mask <= 0.0) discard;
+
+  // Thin spherical shell: normal at this pixel (+z toward the viewer)
+  float rc = min(rr, 1.0);
+  float z = sqrt(1.0 - rc * rc);
+  vec2 nl = ndir * rc;
+  vec2 nxy = vec2(nl.x * uAxis.x - nl.y * uAxis.y,
+                  nl.x * uAxis.y + nl.y * uAxis.x);
+  vec3 n = normalize(vec3(nxy, z));
+
+  // Surface micro-waves (ports the original's jittering-sphere geometry
+  // as a normal bump): the silhouette stays a clean circle, but the
+  // shading normal undulates, so reflections and interference colours
+  // slosh across the film the way they do in the reference.
+  if (uWaves > 0.0) {
+    const float e = 0.15;
+    vec3 sp0 = vec3(nxy, z) * 2.0 + uSeed * 61.3;
+    float w0 = warpnoise3(sp0);
+    vec2 grad = vec2(warpnoise3(sp0 + vec3(e, 0.0, 0.0)) - w0,
+                     warpnoise3(sp0 + vec3(0.0, e, 0.0)) - w0) / e;
+    n = normalize(vec3(n.xy + uWaves * grad * (0.3 + 0.7 * rr), n.z));
+  }
+
+  float cosV = n.z;
+
+  // The view ray crosses the film twice. The back-surface normal points
+  // at the viewer from inside the shell, exactly as the original's
+  // ray-tracer returns it; both surfaces share the same grazing angle
+  // in this thin-shell approximation.
+  vec3 rd = vec3(0.0, 0.0, -1.0);
+  vec3 n2 = normalize(vec3(-n.xy, n.z));
+  float F = mix(R_0, 1.0, pow(1.0 - cosV, 5.0)); // original's fresnel
+
+  // Per-bubble light offset: each bubble wears its highlights and
+  // catch-light at a slightly different angle (seeded, up to ~±29°)
+  float lrot = uSeed.y - 0.5;
+  float lc = cos(lrot);
+  float ls = sin(lrot);
+  vec3 nSpec = normalize(vec3(n.x * lc - n.y * ls, n.x * ls + n.y * lc, n.z));
+
+  // Transmitted light: bend the environment sample by the surface
+  // normal — near zero at the centre, strong at the limb, so the room
+  // warps and compresses around the curvature like a real glass ball.
+  vec2 bend = n.xy * uRefract * uRadius * (0.15 + 2.2 * rr * rr * rr);
+  vec3 refr;
+  refr.r = texture2D(uEnv, envUV(frag - bend * 0.88)).r;
+  refr.g = texture2D(uEnv, envUV(frag - bend)).g;
+  refr.b = texture2D(uEnv, envUV(frag - bend * 1.12)).b;
+
+  float rimBand = smoothstep(0.72, 0.98, rr);
+  float bl = max(dot(normalize(nSpec.xy + vec2(1e-4)), vec2(-0.7071, 0.7071)), 0.0);
+
+  // Reflected view rays off each surface, flattened onto the video
+  // plane: the front reflection inverted and minified, the back one
+  // upright and tighter — two overlapping reflection sets, layered depth.
+  vec3 rv1 = reflect(rd, n);
+  vec3 rv2 = reflect(rd, n2);
+  vec2 reflPx1 = uCenter + (frag - uCenter) * -0.45 + rv1.xy * uRadius * 0.6;
+  vec2 reflPx2 = uCenter + (frag - uCenter) *  0.30 + rv2.xy * uRadius * 0.5;
+  vec3 env1 = fakehdr(texture2D(uEnv, envUV(reflPx1)).rgb);
+  vec3 env2 = fakehdr(texture2D(uEnv, envUV(reflPx2)).rgb);
+
+  // Per-surface film width: thin at the top, dragged thick at the
+  // bottom by gravity, plus warped micro-slosh crawling over the film
+  vec3 spos = vec3(nxy, z) * 1.5 + uSeed * 43.7;
+  float h1 = 0.5 - 0.5 * n.y;    // screen y is down: top of bubble => 1
+  float h2 = 0.5 - 0.5 * n2.y;
+  float filmShift = (uSeed.z - 0.5) * 160.0; // per-bubble thickness start
+  float film1 = VAR_FILMWIDTH * warpnoise3(spos) + filmShift +
+                uThickMin + (1.0 - h1) * (uThickMax - uThickMin);
+  float film2 = VAR_FILMWIDTH * warpnoise3(spos + 2.7) + filmShift +
+                uThickMin + (1.0 - h2) * (uThickMax - uThickMin);
+
+  // The original's spectral interference filter, per surface, then
+  // desaturated toward clear glass by the iridescence knob
+  float sat = min(uIrid * 2.0, 1.0);
+  vec3 filt1 = max(sp_spectral_filter(env1, film1, -cosV), 0.0);
+  vec3 filt2 = max(sp_spectral_filter(env2, film2, -cosV), 0.0);
+  filt1 = mix(vec3(dot(filt1, vec3(0.2126, 0.7152, 0.0722))), filt1, sat);
+  filt2 = mix(vec3(dot(filt2, vec3(0.2126, 0.7152, 0.0722))), filt2, sat);
+
+  // HDR reflections off both surfaces, soft-clipped back into range —
+  // bright parts of the room bloom, dim parts stay glassy-dark
+  vec3 shinyHDR = (filt1 + filt2 * uInnerRefl) * F * 0.35 * uContrast;
+  vec3 shiny = shinyHDR / (1.0 + shinyHDR);
+
+  // Key-light speculars + the exaggerated bottom-left catch-light,
+  // aimed with the seeded per-bubble light rotation
+  shiny += vec3(0.6)  * pow(max(dot(nSpec, normalize(vec3(-0.5, -0.55, 0.67))), 0.0), 160.0);
+  shiny += vec3(0.12) * pow(max(dot(nSpec, normalize(vec3( 0.4,  0.5,  0.77))), 0.0), 90.0);
+  shiny += rimBand * pow(bl, 3.0) * 0.35;
+
+  // Transmitted light dims slightly toward the limb — kept gentle so the
+  // film stays clear and the video reads through nearly untouched
+  float grav = clamp(0.5 + 0.5 * p.y, 0.0, 1.0);
+  float limbDark = 1.0 - smoothstep(0.55, 1.0, rr) * 0.04 * uContrast;
+  // 0.65 keeps the fresnel falloff shape but leaves ~35% of the
+  // background transmitting even at the rim, so it never goes black
+  vec3 col = refr * (1.0 - 0.65 * F) * (1.0 - 0.25 * F * uInnerRefl) *
+             mix(1.01, 0.99, grav) * limbDark + shiny;
+
+  // Per-bubble pastel whisper, mostly near the rim
+  col += uTint * uTintStrength * (0.35 + 0.65 * rimBand);
+
+  gl_FragColor = vec4(col * mask, mask); // premultiplied alpha
+}`;
+
+let glProgram = null;
+let glU = null;
+let videoTex = null;
+
+function initGL() {
+  if (!gl) return false;
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error('shader compile:', gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  };
+  const vs = mk(gl.VERTEX_SHADER, VERT_SRC);
+  const fs = mk(gl.FRAGMENT_SHADER, FRAG_SRC);
+  if (!vs || !fs) return false;
+  glProgram = gl.createProgram();
+  gl.attachShader(glProgram, vs);
+  gl.attachShader(glProgram, fs);
+  gl.linkProgram(glProgram);
+  if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
+    console.error('program link:', gl.getProgramInfoLog(glProgram));
+    glProgram = null;
+    return false;
+  }
+  gl.useProgram(glProgram);
+
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER,
+    new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const aCorner = gl.getAttribLocation(glProgram, 'aCorner');
+  gl.enableVertexAttribArray(aCorner);
+  gl.vertexAttribPointer(aCorner, 2, gl.FLOAT, false, 0, 0);
+
+  glU = {};
+  for (const name of ['uRes', 'uTime', 'uEnv', 'uEnvA', 'uEnvB', 'uCenter',
+    'uRadius', 'uExtent', 'uPhase', 'uWiggle', 'uStretch', 'uAxis', 'uTint',
+    'uTintStrength', 'uIrid', 'uRefract', 'uInnerRefl', 'uContrast',
+    'uWaves', 'uThickMin', 'uThickMax', 'uSeed', 'uSquish', 'uContacts',
+    'uNumContacts']) {
+    glU[name] = gl.getUniformLocation(glProgram, name);
+  }
+
+  videoTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // premultiplied alpha
+  return true;
+}
+
+function renderGL(now, dt) {
+  if (!glProgram) return;
+  const w = glCanvas.width;
+  const h = glCanvas.height;
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!bubbles.length || video.readyState < 2) return;
+
+  // Smoothed speed per bubble drives the extra air-resistance wiggle
+  for (const b of bubbles) {
+    const moved = Math.hypot(b.x - b.lx, b.y - b.ly);
+    b.lx = b.x; b.ly = b.y;
+    if (dt > 0) b.spd = b.spd * 0.85 + (moved / dt) * 0.15;
+  }
+
+  gl.useProgram(glProgram);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.uniform1i(glU.uEnv, 0);
+
+  // Screen px -> video uv, replicating object-fit: cover + the CSS mirror
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const scale = Math.max(w / vw, h / vh);
+  const offX = (w - vw * scale) / 2;
+  const offY = (h - vh * scale) / 2;
+  gl.uniform2f(glU.uEnvA, -1 / (vw * scale), 1 / (vh * scale));
+  gl.uniform2f(glU.uEnvB, (offX + vw * scale) / (vw * scale), -offY / (vh * scale));
+
+  gl.uniform2f(glU.uRes, w, h);
+  gl.uniform1f(glU.uTime, now);
+  gl.uniform1f(glU.uIrid, IRIDESCENCE_STRENGTH);
+  gl.uniform1f(glU.uRefract, REFRACTION_AMOUNT);
+  gl.uniform1f(glU.uInnerRefl, INNER_REFLECTION);
+  gl.uniform1f(glU.uContrast, REFLECTION_CONTRAST);
+  gl.uniform1f(glU.uWaves, SURFACE_WAVES);
+  gl.uniform1f(glU.uSquish, CONTACT_SQUISH);
+  gl.uniform1f(glU.uThickMin, FILM_THICKNESS_MIN);
+  gl.uniform1f(glU.uThickMax, FILM_THICKNESS_MAX);
+  gl.uniform1f(glU.uTintStrength, TINT_STRENGTH);
+
+  const dpr = window.devicePixelRatio || 1;
+  const deforms = bubbles.map(b => bubbleDeform(b, now));
+  const contactArr = new Float32Array(9);
+  for (let i = 0; i < bubbles.length; i++) {
+    const b = bubbles[i];
+    const { scaleIn, stretch } = deforms[i];
+    const r = b.r * scaleIn * dpr;
+    if (r < 1) continue;
+
+    // Touching neighbours: direction + shared-wall distance (in radii).
+    // The wall sits on the radical plane between the two spheres; the
+    // deepest three contacts are sent to the shader, rotated into this
+    // bubble's circle space so they line up with its outline maths.
+    const rB = b.r * scaleIn;
+    const contacts = [];
+    for (let j = 0; j < bubbles.length; j++) {
+      if (j === i) continue;
+      const o = bubbles[j];
+      const rO = o.r * deforms[j].scaleIn;
+      const dx = o.x - b.x, dy = o.y - b.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 1 || d >= rB + rO) continue;
+      let wall = (d * d + rB * rB - rO * rO) / (2 * d);
+      wall = Math.max(0.25 * rB, Math.min(wall, rB));
+      contacts.push({ depth: rB + rO - d, x: dx / d, y: dy / d, wall: wall / rB });
+    }
+    contacts.sort((p, q) => q.depth - p.depth);
+    const nContacts = Math.min(3, contacts.length);
+    const cosA = Math.cos(b.releaseAngle);
+    const sinA = Math.sin(b.releaseAngle);
+    contactArr.fill(0);
+    for (let k = 0; k < nContacts; k++) {
+      const c = contacts[k];
+      contactArr[k * 3]     =  c.x * cosA + c.y * sinA;
+      contactArr[k * 3 + 1] = -c.x * sinA + c.y * cosA;
+      contactArr[k * 3 + 2] = c.wall;
+    }
+
+    const amp = WIGGLE_AMOUNT * (1 + Math.min(b.spd / 300, 2) * WIGGLE_SPEED_BOOST);
+    gl.uniform2f(glU.uCenter, b.x * dpr, b.y * dpr);
+    gl.uniform1f(glU.uRadius, r);
+    gl.uniform1f(glU.uExtent, r * QUAD_MARGIN * (1 + Math.abs(stretch)));
+    gl.uniform1f(glU.uPhase, b.phase);
+    gl.uniform1f(glU.uWiggle, amp);
+    gl.uniform1f(glU.uStretch, stretch);
+    gl.uniform2f(glU.uAxis, cosA, sinA);
+    gl.uniform3f(glU.uTint, b.tint[0], b.tint[1], b.tint[2]);
+    gl.uniform3f(glU.uSeed, b.seed[0], b.seed[1], b.seed[2]);
+    gl.uniform3fv(glU.uContacts, contactArr);
+    gl.uniform1i(glU.uNumContacts, nContacts);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+}
+
 // --- World state ---
 let nextBubbleId = 1;
 const bubbles = [];   // { id, x, y, r, state: 'growing'|'floating', handIndex, phase, born }
@@ -205,7 +660,8 @@ function spawnBubble(x, y, handIndex) {
     phase: Math.random() * Math.PI * 2,
     born: performance.now() / 1000,
     releaseAngle: Math.PI / 2, // toward the hand; overwritten at release
-    tintHue: TINT_HUES[Math.floor(Math.random() * TINT_HUES.length)],
+    tint: TINT_RGBS[Math.floor(Math.random() * TINT_RGBS.length)],
+    seed: [Math.random(), Math.random(), Math.random()], // per-bubble uniqueness
     lx: x, ly: y, spd: 0, // previous position + smoothed speed, for wobble
   };
   bubbles.push(b);
@@ -359,157 +815,31 @@ function bubbleDeform(b, now) {
   return { age, scaleIn, stretch };
 }
 
-// Trace the bubble outline as the current canvas path: a circle rippled
-// by two layered sine waves (surface tension), rippling harder when the
-// bubble moves fast, and stretched along the release axis by the snap.
-function traceBubble(b, now, deform) {
-  const { scaleIn, stretch } = deform;
-  const cosA = Math.cos(b.releaseAngle);
-  const sinA = Math.sin(b.releaseAngle);
-  const amp = WIGGLE_AMOUNT * (1 + Math.min(b.spd / 300, 2) * WIGGLE_SPEED_BOOST);
-  const N = 48;
-  ctx.beginPath();
-  for (let i = 0; i <= N; i++) {
-    const th = (i / N) * TAU;
-    const ripple = 1 +
-      amp * Math.sin(3 * th + now * 1.8 + b.phase) +
-      amp * 0.6 * Math.sin(5 * th - now * 2.6 + b.phase * 2);
-    const rr = b.r * scaleIn * ripple;
-    const lx = Math.cos(th) * rr * (1 + stretch);
-    const ly = Math.sin(th) * rr * (1 - 0.6 * stretch);
-    const x = b.x + lx * cosA - ly * sinA;
-    const y = b.y + lx * sinA + ly * cosA;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.closePath();
-}
-
-function drawBubble(b, now, dt) {
-  // Smoothed speed estimate drives the air-resistance wobble
-  const dx = b.x - b.lx;
-  const dy = b.y - b.ly;
-  b.lx = b.x; b.ly = b.y;
-  if (dt > 0) b.spd = b.spd * 0.85 + (Math.hypot(dx, dy) / dt) * 0.15;
-
-  const deform = bubbleDeform(b, now);
-  const { age, scaleIn } = deform;
+// Brief necking at the base as a released bubble detaches. Everything
+// else about the bubble surface now lives in the WebGL layer.
+function drawNeck(b, now) {
+  const { age, scaleIn } = bubbleDeform(b, now);
+  if (b.state !== 'floating' || age >= NECK_TIME) return;
   const r = b.r * scaleIn;
-  if (r < 1) return;
-
-  // 1. Fake refraction — the most important layer. The webcam scene,
-  // mirrored to match the selfie view, is painted back inside the
-  // bubble slightly magnified about its centre, nudged off-axis, and
-  // gently "breathing", so the film reads as a lens, not a drawn circle.
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (vw && REFLECTION_OPACITY > 0) {
-    const cw = window.innerWidth, ch = window.innerHeight;
-    const scale = Math.max(cw / vw, ch / vh);
-    const offX = (cw - vw * scale) / 2;
-    const offY = (ch - vh * scale) / 2;
-    ctx.save();
-    traceBubble(b, now, deform);
-    ctx.clip();
-    ctx.globalAlpha = REFLECTION_OPACITY;
-    const zoom = REFRACTION_ZOOM * (1 + 0.04 * Math.sin(now * 1.3 + b.phase));
-    ctx.translate(b.x - r * 0.06, b.y - r * 0.1); // slight off-axis nudge
-    ctx.scale(zoom, zoom);
-    ctx.translate(-b.x, -b.y);
-    ctx.scale(-1, 1); // same mirror as the CSS selfie view
-    ctx.drawImage(video, -(offX + vw * scale), offY, vw * scale, vh * scale);
-    ctx.restore();
-  }
-
-  // 2. Film + pastel tint: almost nothing in the body — a faint density
-  // right at the edge where the film curves away, plus a whisper of the
-  // bubble's birth colour drifting across it.
-  traceBubble(b, now, deform);
-  const film = ctx.createRadialGradient(b.x, b.y, r * 0.2, b.x, b.y, r);
-  film.addColorStop(0.00, 'rgba(255, 255, 255, 0.02)');
-  film.addColorStop(0.85, 'rgba(255, 255, 255, 0.04)');
-  film.addColorStop(0.97, 'rgba(255, 255, 255, 0.14)');
-  film.addColorStop(1.00, 'rgba(255, 255, 255, 0.04)');
-  ctx.fillStyle = film;
-  ctx.fill();
-
-  const tint = ctx.createLinearGradient(b.x - r, b.y - r, b.x + r, b.y + r);
-  tint.addColorStop(0, `hsla(${b.tintHue}, 80%, 80%, ${TINT_STRENGTH})`);
-  tint.addColorStop(0.55, `hsla(${b.tintHue}, 80%, 80%, 0)`);
-  tint.addColorStop(1, `hsla(${(b.tintHue + 40) % 360}, 80%, 80%, ${TINT_STRENGTH * 0.6})`);
-  ctx.fillStyle = tint;
-  ctx.fill();
-
-  // 3. Rim: thin bright edge on the traced outline, brightest at the
-  // bottom-left as an exaggerated catch-light…
-  const rim = ctx.createLinearGradient(b.x - r * 0.7, b.y + r * 0.7,
-                                       b.x + r * 0.7, b.y - r * 0.7);
-  rim.addColorStop(0.0, 'rgba(255, 255, 255, 0.9)');
-  rim.addColorStop(0.5, 'rgba(255, 255, 255, 0.28)');
-  rim.addColorStop(1.0, 'rgba(255, 255, 255, 0.12)');
-  ctx.lineWidth = Math.max(1.2, r * 0.02);
-  ctx.strokeStyle = rim;
-  ctx.stroke();
-
-  // …plus a glow pass whose gradient is transparent everywhere except
-  // that bottom-left arc, so the glow hugs only the catch-light.
-  ctx.save();
-  const glow = ctx.createLinearGradient(b.x - r * 0.7, b.y + r * 0.7,
-                                        b.x + r * 0.7, b.y - r * 0.7);
-  glow.addColorStop(0.00, 'rgba(255, 255, 255, 0.8)');
-  glow.addColorStop(0.35, 'rgba(255, 255, 255, 0)');
-  ctx.shadowColor = 'rgba(255, 255, 255, 0.7)';
-  ctx.shadowBlur = r * 0.18;
-  ctx.lineWidth = Math.max(1.5, r * 0.035);
-  ctx.strokeStyle = glow;
-  ctx.stroke();
-  ctx.restore();
-
-  // 4. Highlights, in screen space (lights don't rotate with the bubble):
-  // one sharp specular streak with a hard core upper-left…
-  ctx.save();
-  ctx.translate(b.x - r * 0.42, b.y - r * 0.46);
-  ctx.rotate(-0.7);
+  const k = 1 - age / NECK_TIME;
+  const ax = Math.cos(b.releaseAngle), ay = Math.sin(b.releaseAngle);
+  const bx = b.x + ax * r * 0.92, by = b.y + ay * r * 0.92;
+  const tx = b.x + ax * r * (1 + 0.45 * k), ty = b.y + ay * r * (1 + 0.45 * k);
+  const w = r * 0.3 * k;
   ctx.beginPath();
-  ctx.ellipse(0, 0, r * 0.16, r * 0.06, 0, 0, TAU);
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.moveTo(bx - ay * w, by + ax * w);
+  ctx.quadraticCurveTo(tx, ty, bx + ay * w, by - ax * w);
+  ctx.closePath();
+  ctx.fillStyle = `rgba(255, 255, 255, ${0.5 * k})`;
   ctx.fill();
-  ctx.beginPath();
-  ctx.arc(r * 0.05, 0, r * 0.045, 0, TAU);
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-  ctx.fill();
-  ctx.restore();
-
-  // …and a fainter bounce lower-right.
-  ctx.save();
-  ctx.translate(b.x + r * 0.36, b.y + r * 0.44);
-  ctx.rotate(2.45);
-  ctx.beginPath();
-  ctx.ellipse(0, 0, r * 0.11, r * 0.045, 0, 0, TAU);
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
-  ctx.fill();
-  ctx.restore();
-
-  // 5. Brief necking at the base as the bubble detaches
-  if (b.state === 'floating' && age < NECK_TIME) {
-    const k = 1 - age / NECK_TIME;
-    const ax = Math.cos(b.releaseAngle), ay = Math.sin(b.releaseAngle);
-    const bx = b.x + ax * r * 0.92, by = b.y + ay * r * 0.92;
-    const tx = b.x + ax * r * (1 + 0.45 * k), ty = b.y + ay * r * (1 + 0.45 * k);
-    const w = r * 0.3 * k;
-    ctx.beginPath();
-    ctx.moveTo(bx - ay * w, by + ax * w);
-    ctx.quadraticCurveTo(tx, ty, bx + ay * w, by - ax * w);
-    ctx.closePath();
-    ctx.fillStyle = `rgba(255, 255, 255, ${0.5 * k})`;
-    ctx.fill();
-  }
 }
 
-function draw(now, dt) {
+function draw(now) {
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
-  for (const b of bubbles) drawBubble(b, now, dt);
+  // Bubble surfaces render in the WebGL layer below; the 2D canvas keeps
+  // the pinch-off necks, pop particles, and hand markers on top.
+  for (const b of bubbles) drawNeck(b, now);
 
   for (const p of particles) {
     const t = Math.max(0, p.life / p.maxLife);
@@ -544,12 +874,14 @@ function loop(landmarker) {
 
   const now = nowMs / 1000;
   update(dt, now);
-  draw(now, dt);
+  renderGL(now, dt);
+  draw(now);
   requestAnimationFrame(() => loop(landmarker));
 }
 
 async function main() {
   try {
+    if (!initGL()) setStatus('WebGL failed — see console; bubbles disabled', 'err');
     await startCamera();
     setStatus('loading hand tracker…');
     const landmarker = await loadHandLandmarker();
