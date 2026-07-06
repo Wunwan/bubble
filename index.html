@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bubble</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0b0e14;
+    overflow: hidden;
+  }
+  /* Selfie video fills the screen, mirrored so it feels like a mirror */
+  #cam {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+  /* Overlay canvas sits on top; we mirror coordinates in JS, not CSS */
+  #overlay {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+  /* Cinematic grade: a gentle lift on the whole scene (video + bubbles)… */
+  #scene {
+    position: fixed;
+    inset: 0;
+    filter: saturate(1.12) contrast(1.05) brightness(1.03);
+  }
+  /* …a cool-shadow / warm-highlight wash… */
+  #tint {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(160deg,
+      rgba(70, 150, 255, 0.22),
+      rgba(20, 30, 60, 0) 45%,
+      rgba(255, 168, 92, 0.18));
+    mix-blend-mode: soft-light;
+  }
+  /* …and a soft edge vignette to pull focus to the center */
+  #vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center,
+      transparent 52%,
+      rgba(4, 6, 14, 0.42) 100%);
+  }
+  #status {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 6px 14px;
+    border-radius: 999px;
+    font: 13px/1.4 -apple-system, system-ui, sans-serif;
+    color: #e6e9f0;
+    background: rgba(11, 14, 20, 0.65);
+    backdrop-filter: blur(6px);
+    transition: opacity 0.6s;
+  }
+  #status.ok { color: #7ee787; }
+  #status.err { color: #ff7b72; }
+</style>
+</head>
+<body>
+<div id="scene">
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="tint"></div>
+<div id="vignette"></div>
+<div id="status">requesting camera…</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+const video = document.getElementById('cam');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+
+const WRIST = 0;
+const THUMB_TIP = 4;
+const INDEX_MCP = 5;
+const INDEX_TIP = 8;
+
+// --- Feel tuning -----------------------------------------------------
+// Pinch gesture: ratios of thumb–index gap to hand span.
+const PINCH_START_RATIO = 0.30; // pinch begins below this — lower = must pinch tighter
+const PINCH_END_RATIO   = 0.45; // pinch ends above this — gap vs START is hysteresis against jitter
+
+// Inflation
+const SPAWN_RADIUS  = 14;  // px, bubble size the moment a pinch begins
+const MAX_RADIUS    = 90;  // px, inflation cap
+const INFLATE_SPEED = 55;  // px of radius per second while the pinch is held
+
+// Popping: fingertip pops a bubble within radius × this.
+const POP_RADIUS_SCALE = 1.0; // 1 = exact edge; raise = forgiving, lower = strict
+
+// Drift
+const RISE_SPEED = 60;   // px per second upward
+const SWAY_AMOUNT = 22;  // px of horizontal sway
+const SWAY_FREQ = 1.6;   // sway oscillations per second-ish
+
+// Birth: pinch-off snap when the bubble is released
+const SNAP_INTENSITY = 0.18; // 0 = detaches with no stretch … 0.35 = cartoonish
+const SNAP_WOBBLE_HZ = 6;    // release-wobble speed
+const SNAP_SETTLE    = 4;    // how fast the wobble dies out (per second)
+const NECK_TIME      = 0.12; // s the detaching neck stays visible
+
+// --- Look tuning -------------------------------------------------------
+const REFLECTION_OPACITY = 0.35; // fake lens reflection of the room inside the bubble
+const REFRACTION_ZOOM    = 1.18; // how much that reflection magnifies the scene
+const TINT_STRENGTH      = 0.07; // per-bubble pastel wash — keep whisper-faint
+const WIGGLE_AMOUNT      = 0.02; // outline ripple, as a fraction of radius
+const WIGGLE_SPEED_BOOST = 1.5;  // extra ripple when moving fast (air resistance)
+
+// Pastel tints a bubble can be born with (hues; drawn whisper-faint)
+const TINT_HUES = [210, 48, 340, 150, 270]; // pale blue, butter, rose, mint, lavender
+
+function setStatus(msg, cls) {
+  status.style.opacity = '1';
+  status.textContent = msg;
+  status.className = cls || '';
+}
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = window.innerWidth * dpr;
+  canvas.height = window.innerHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function loadHandLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+  );
+  return HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+      delegate: 'GPU',
+    },
+    runningMode: 'VIDEO',
+    numHands: 2,
+  });
+}
+
+// Map a normalized landmark (0..1 in video frame) to screen pixels,
+// replicating the video's object-fit: cover crop and its CSS mirror.
+function landmarkToScreen(lm) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = window.innerWidth, ch = window.innerHeight;
+  const scale = Math.max(cw / vw, ch / vh);
+  const offX = (cw - vw * scale) / 2;
+  const offY = (ch - vh * scale) / 2;
+  return {
+    x: offX + (1 - lm.x) * vw * scale, // mirrored to match the selfie view
+    y: offY + lm.y * vh * scale,
+  };
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// --- World state ---
+let nextBubbleId = 1;
+const bubbles = [];   // { id, x, y, r, state: 'growing'|'floating', handIndex, phase, born }
+const particles = []; // { x, y, vx, vy, life, maxLife }
+
+// Per-hand interaction state, indexed by hand slot (0, 1)
+const hands = [
+  { pinching: false, bubbleId: null, insideIds: new Set() },
+  { pinching: false, bubbleId: null, insideIds: new Set() },
+];
+
+function spawnBubble(x, y, handIndex) {
+  const b = {
+    id: nextBubbleId++,
+    x, y,
+    r: SPAWN_RADIUS,
+    state: 'growing',
+    handIndex,
+    phase: Math.random() * Math.PI * 2,
+    born: performance.now() / 1000,
+    releaseAngle: Math.PI / 2, // toward the hand; overwritten at release
+    tintHue: TINT_HUES[Math.floor(Math.random() * TINT_HUES.length)],
+    lx: x, ly: y, spd: 0, // previous position + smoothed speed, for wobble
+  };
+  bubbles.push(b);
+  return b;
+}
+
+function popBubble(b) {
+  const n = Math.round(10 + b.r * 0.15);
+  for (let i = 0; i < n; i++) {
+    const ang = (i / n) * Math.PI * 2 + Math.random() * 0.5;
+    const speed = 120 + Math.random() * 160;
+    particles.push({
+      x: b.x + Math.cos(ang) * b.r * 0.7,
+      y: b.y + Math.sin(ang) * b.r * 0.7,
+      vx: Math.cos(ang) * speed,
+      vy: Math.sin(ang) * speed,
+      life: 0.5 + Math.random() * 0.25,
+      maxLife: 0.75,
+    });
+  }
+  const idx = bubbles.indexOf(b);
+  if (idx !== -1) bubbles.splice(idx, 1);
+}
+
+// --- Interaction: consume one detection result ---
+function handleHands(result) {
+  const seen = new Set();
+
+  (result?.landmarks || []).forEach((lm, i) => {
+    if (i > 1) return;
+    seen.add(i);
+    const hand = hands[i];
+
+    const thumb = landmarkToScreen(lm[THUMB_TIP]);
+    const index = landmarkToScreen(lm[INDEX_TIP]);
+    const span = dist(landmarkToScreen(lm[WRIST]), landmarkToScreen(lm[INDEX_MCP]));
+    if (span < 1) return;
+
+    const pinchRatio = dist(thumb, index) / span;
+    const pinchPoint = { x: (thumb.x + index.x) / 2, y: (thumb.y + index.y) / 2 };
+
+    // Pinch state machine with hysteresis
+    if (!hand.pinching && pinchRatio < PINCH_START_RATIO) {
+      hand.pinching = true;
+      hand.bubbleId = spawnBubble(pinchPoint.x, pinchPoint.y, i).id;
+    } else if (hand.pinching && pinchRatio > PINCH_END_RATIO) {
+      hand.pinching = false;
+      const b = bubbles.find(b => b.id === hand.bubbleId);
+      if (b) {
+        b.state = 'floating';
+        b.born = performance.now() / 1000;
+        // Pinch-off points back at the hand: the snap stretch and the
+        // detaching neck are drawn along this axis.
+        const wrist = landmarkToScreen(lm[WRIST]);
+        b.releaseAngle = Math.atan2(wrist.y - b.y, wrist.x - b.x);
+        // The releasing fingertip may sit inside the bubble; mark it so it
+        // must exit and re-enter before it can pop this bubble.
+        if (dist(index, b) < b.r * POP_RADIUS_SCALE) hand.insideIds.add(b.id);
+      }
+      hand.bubbleId = null;
+    }
+
+    // Growing bubble follows the pinch point
+    if (hand.pinching && hand.bubbleId !== null) {
+      const b = bubbles.find(b => b.id === hand.bubbleId);
+      if (b) { b.x = pinchPoint.x; b.y = pinchPoint.y; }
+    }
+
+    // Pop detection: edge-triggered on fingertip entering a floating bubble.
+    // A pinching hand's fingertip is busy; don't let it pop things.
+    const nowInside = new Set();
+    if (!hand.pinching) {
+      for (const b of bubbles) {
+        if (b.state !== 'floating') continue;
+        if (dist(index, b) < b.r * POP_RADIUS_SCALE) {
+          nowInside.add(b.id);
+          if (!hand.insideIds.has(b.id)) popBubble(b);
+        }
+      }
+    }
+    hand.insideIds = nowInside;
+
+    hand.landmarks = lm; // stash for drawing
+  });
+
+  // Hands that vanished: release their growing bubble so it isn't orphaned
+  for (let i = 0; i < hands.length; i++) {
+    if (seen.has(i)) continue;
+    const hand = hands[i];
+    if (hand.pinching) {
+      hand.pinching = false;
+      const b = bubbles.find(b => b.id === hand.bubbleId);
+      if (b) { b.state = 'floating'; b.born = performance.now() / 1000; }
+      hand.bubbleId = null;
+    }
+    hand.insideIds.clear();
+    hand.landmarks = null;
+  }
+}
+
+// --- Physics + rendering ---
+function update(dt, now) {
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (b.state === 'growing') {
+      b.r = Math.min(MAX_RADIUS, b.r + INFLATE_SPEED * dt);
+    } else {
+      const age = now - b.born;
+      b.y -= RISE_SPEED * dt;
+      b.x += Math.cos(age * SWAY_FREQ * Math.PI + b.phase) * SWAY_AMOUNT * dt;
+      if (b.y + b.r < 0) bubbles.splice(i, 1); // floated off the top
+    }
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.94;
+    p.vy *= 0.94;
+  }
+}
+
+function drawDot(p, radius, fill) {
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+const TAU = Math.PI * 2;
+
+// Rendering-only deformation; hit detection still uses the true x, y, r.
+function bubbleDeform(b, now) {
+  const age = now - b.born;
+  let scaleIn = 1;
+  let stretch = 0;
+  if (b.state === 'growing') {
+    // Ease in from tiny so the bubble doesn't just appear
+    const k = Math.min(1, age / 0.15);
+    scaleIn = 1 - (1 - k) * (1 - k);
+  } else {
+    // Pinch-off snap: starts stretched toward the hand, then a damped
+    // wobble settles it back into a round sphere.
+    stretch = SNAP_INTENSITY *
+      Math.exp(-age * SNAP_SETTLE) *
+      Math.cos(age * SNAP_WOBBLE_HZ * TAU);
+  }
+  return { age, scaleIn, stretch };
+}
+
+// Trace the bubble outline as the current canvas path: a circle rippled
+// by two layered sine waves (surface tension), rippling harder when the
+// bubble moves fast, and stretched along the release axis by the snap.
+function traceBubble(b, now, deform) {
+  const { scaleIn, stretch } = deform;
+  const cosA = Math.cos(b.releaseAngle);
+  const sinA = Math.sin(b.releaseAngle);
+  const amp = WIGGLE_AMOUNT * (1 + Math.min(b.spd / 300, 2) * WIGGLE_SPEED_BOOST);
+  const N = 48;
+  ctx.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const th = (i / N) * TAU;
+    const ripple = 1 +
+      amp * Math.sin(3 * th + now * 1.8 + b.phase) +
+      amp * 0.6 * Math.sin(5 * th - now * 2.6 + b.phase * 2);
+    const rr = b.r * scaleIn * ripple;
+    const lx = Math.cos(th) * rr * (1 + stretch);
+    const ly = Math.sin(th) * rr * (1 - 0.6 * stretch);
+    const x = b.x + lx * cosA - ly * sinA;
+    const y = b.y + lx * sinA + ly * cosA;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function drawBubble(b, now, dt) {
+  // Smoothed speed estimate drives the air-resistance wobble
+  const dx = b.x - b.lx;
+  const dy = b.y - b.ly;
+  b.lx = b.x; b.ly = b.y;
+  if (dt > 0) b.spd = b.spd * 0.85 + (Math.hypot(dx, dy) / dt) * 0.15;
+
+  const deform = bubbleDeform(b, now);
+  const { age, scaleIn } = deform;
+  const r = b.r * scaleIn;
+  if (r < 1) return;
+
+  // 1. Fake refraction — the most important layer. The webcam scene,
+  // mirrored to match the selfie view, is painted back inside the
+  // bubble slightly magnified about its centre, nudged off-axis, and
+  // gently "breathing", so the film reads as a lens, not a drawn circle.
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (vw && REFLECTION_OPACITY > 0) {
+    const cw = window.innerWidth, ch = window.innerHeight;
+    const scale = Math.max(cw / vw, ch / vh);
+    const offX = (cw - vw * scale) / 2;
+    const offY = (ch - vh * scale) / 2;
+    ctx.save();
+    traceBubble(b, now, deform);
+    ctx.clip();
+    ctx.globalAlpha = REFLECTION_OPACITY;
+    const zoom = REFRACTION_ZOOM * (1 + 0.04 * Math.sin(now * 1.3 + b.phase));
+    ctx.translate(b.x - r * 0.06, b.y - r * 0.1); // slight off-axis nudge
+    ctx.scale(zoom, zoom);
+    ctx.translate(-b.x, -b.y);
+    ctx.scale(-1, 1); // same mirror as the CSS selfie view
+    ctx.drawImage(video, -(offX + vw * scale), offY, vw * scale, vh * scale);
+    ctx.restore();
+  }
+
+  // 2. Film + pastel tint: almost nothing in the body — a faint density
+  // right at the edge where the film curves away, plus a whisper of the
+  // bubble's birth colour drifting across it.
+  traceBubble(b, now, deform);
+  const film = ctx.createRadialGradient(b.x, b.y, r * 0.2, b.x, b.y, r);
+  film.addColorStop(0.00, 'rgba(255, 255, 255, 0.02)');
+  film.addColorStop(0.85, 'rgba(255, 255, 255, 0.04)');
+  film.addColorStop(0.97, 'rgba(255, 255, 255, 0.14)');
+  film.addColorStop(1.00, 'rgba(255, 255, 255, 0.04)');
+  ctx.fillStyle = film;
+  ctx.fill();
+
+  const tint = ctx.createLinearGradient(b.x - r, b.y - r, b.x + r, b.y + r);
+  tint.addColorStop(0, `hsla(${b.tintHue}, 80%, 80%, ${TINT_STRENGTH})`);
+  tint.addColorStop(0.55, `hsla(${b.tintHue}, 80%, 80%, 0)`);
+  tint.addColorStop(1, `hsla(${(b.tintHue + 40) % 360}, 80%, 80%, ${TINT_STRENGTH * 0.6})`);
+  ctx.fillStyle = tint;
+  ctx.fill();
+
+  // 3. Rim: thin bright edge on the traced outline, brightest at the
+  // bottom-left as an exaggerated catch-light…
+  const rim = ctx.createLinearGradient(b.x - r * 0.7, b.y + r * 0.7,
+                                       b.x + r * 0.7, b.y - r * 0.7);
+  rim.addColorStop(0.0, 'rgba(255, 255, 255, 0.9)');
+  rim.addColorStop(0.5, 'rgba(255, 255, 255, 0.28)');
+  rim.addColorStop(1.0, 'rgba(255, 255, 255, 0.12)');
+  ctx.lineWidth = Math.max(1.2, r * 0.02);
+  ctx.strokeStyle = rim;
+  ctx.stroke();
+
+  // …plus a glow pass whose gradient is transparent everywhere except
+  // that bottom-left arc, so the glow hugs only the catch-light.
+  ctx.save();
+  const glow = ctx.createLinearGradient(b.x - r * 0.7, b.y + r * 0.7,
+                                        b.x + r * 0.7, b.y - r * 0.7);
+  glow.addColorStop(0.00, 'rgba(255, 255, 255, 0.8)');
+  glow.addColorStop(0.35, 'rgba(255, 255, 255, 0)');
+  ctx.shadowColor = 'rgba(255, 255, 255, 0.7)';
+  ctx.shadowBlur = r * 0.18;
+  ctx.lineWidth = Math.max(1.5, r * 0.035);
+  ctx.strokeStyle = glow;
+  ctx.stroke();
+  ctx.restore();
+
+  // 4. Highlights, in screen space (lights don't rotate with the bubble):
+  // one sharp specular streak with a hard core upper-left…
+  ctx.save();
+  ctx.translate(b.x - r * 0.42, b.y - r * 0.46);
+  ctx.rotate(-0.7);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 0.16, r * 0.06, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(r * 0.05, 0, r * 0.045, 0, TAU);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+  ctx.fill();
+  ctx.restore();
+
+  // …and a fainter bounce lower-right.
+  ctx.save();
+  ctx.translate(b.x + r * 0.36, b.y + r * 0.44);
+  ctx.rotate(2.45);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 0.11, r * 0.045, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+  ctx.fill();
+  ctx.restore();
+
+  // 5. Brief necking at the base as the bubble detaches
+  if (b.state === 'floating' && age < NECK_TIME) {
+    const k = 1 - age / NECK_TIME;
+    const ax = Math.cos(b.releaseAngle), ay = Math.sin(b.releaseAngle);
+    const bx = b.x + ax * r * 0.92, by = b.y + ay * r * 0.92;
+    const tx = b.x + ax * r * (1 + 0.45 * k), ty = b.y + ay * r * (1 + 0.45 * k);
+    const w = r * 0.3 * k;
+    ctx.beginPath();
+    ctx.moveTo(bx - ay * w, by + ax * w);
+    ctx.quadraticCurveTo(tx, ty, bx + ay * w, by - ax * w);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(255, 255, 255, ${0.5 * k})`;
+    ctx.fill();
+  }
+}
+
+function draw(now, dt) {
+  ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+  for (const b of bubbles) drawBubble(b, now, dt);
+
+  for (const p of particles) {
+    const t = Math.max(0, p.life / p.maxLife);
+    drawDot(p, 3 * t + 1, `rgba(255, 255, 255, ${t})`);
+  }
+
+  // Hand landmarks, kept faint for debugging
+  for (const hand of hands) {
+    if (!hand.landmarks) continue;
+    hand.landmarks.forEach((lm, i) => {
+      if (i === THUMB_TIP || i === INDEX_TIP) return;
+      drawDot(landmarkToScreen(lm), 3, 'rgba(255, 255, 255, 0.3)');
+    });
+    drawDot(landmarkToScreen(hand.landmarks[INDEX_TIP]), 7, '#4dd6ff');
+    drawDot(landmarkToScreen(hand.landmarks[THUMB_TIP]), 7, '#ff6bd6');
+  }
+}
+
+let lastVideoTime = -1;
+let lastFrameTime = performance.now();
+
+function loop(landmarker) {
+  const nowMs = performance.now();
+  const dt = Math.min(0.05, (nowMs - lastFrameTime) / 1000);
+  lastFrameTime = nowMs;
+
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, nowMs);
+    handleHands(result);
+  }
+
+  const now = nowMs / 1000;
+  update(dt, now);
+  draw(now, dt);
+  requestAnimationFrame(() => loop(landmarker));
+}
+
+async function main() {
+  try {
+    await startCamera();
+    setStatus('loading hand tracker…');
+    const landmarker = await loadHandLandmarker();
+    setStatus('tracking ✓', 'ok');
+    setTimeout(() => { status.style.opacity = '0'; }, 2500);
+    loop(landmarker);
+  } catch (err) {
+    setStatus((err.name || 'error') + ': ' + (err.message || err), 'err');
+    console.error(err);
+  }
+}
+
+main();
+</script>
+</body>
+</html>
