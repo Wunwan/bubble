@@ -72,18 +72,39 @@ const video = document.getElementById('cam');
 const canvas = document.getElementById('overlay');
 const ctx = canvas.getContext('2d');
 const glCanvas = document.getElementById('gl');
-const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true });
+const gl = glCanvas.getContext('webgl', { alpha: true, antialias: false, powerPreference: 'high-performance' });
 const status = document.getElementById('status');
 
 const WRIST = 0;
 const THUMB_TIP = 4;
 const INDEX_MCP = 5;
 const INDEX_TIP = 8;
+const MIDDLE_TIP = 12;
+const RING_TIP = 16;
 
 // --- Feel tuning -----------------------------------------------------
 // Pinch gesture: ratios of thumb–index gap to hand span.
 const PINCH_START_RATIO = 0.30; // pinch begins below this — lower = must pinch tighter
 const PINCH_END_RATIO   = 0.45; // pinch ends above this — gap vs START is hysteresis against jitter
+
+// "Sheet" gesture: index+middle+ring curled toward the thumb (a closed
+// ring/O), separate from the two-finger pinch above. Averaging three
+// fingertip gaps is what keeps this from firing during a normal pinch,
+// where the other fingers stay open. Dragging while holding this pose
+// trails a giant undulating soap-film sheet behind the hand.
+const RING_START_RATIO = 0.38; // ring/O pose begins when the avg fingertip-thumb gap drops below this
+const RING_END_RATIO   = 0.55; // ring pose ends above this — hysteresis against jitter
+
+const SHEET_MAX_POINTS    = 20;   // spine samples kept — trail reaches ~this × SHEET_POINT_SPACING px
+const SHEET_POINT_SPACING = 26;   // px of (lag-smoothed) travel between recorded spine points
+const SHEET_LAG           = 0.05; // 0 = spine head snaps to the hand instantly, closer to 1 = looser/slower to catch up
+const SHEET_WIDTH         = 130;  // px, ribbon half-width — overall sheet size
+const SHEET_RIPPLE_AMOUNT = 34;   // px, base undulation amplitude
+const SHEET_RIPPLE_FREQ   = 1.0;  // spatial frequency multiplier of the folds along the sheet
+const SHEET_RIPPLE_SPEED  = 1.6;  // rad/s, how fast the folds roll
+const SHEET_BILLOW        = 1.0;  // how much more the tail billows than the taut leading edge near the hand
+const SHEET_INTERFERENCE  = 1.0;  // thickness-variation intensity — higher = wilder rainbow swirl
+const SHEET_DISSIPATE_TIME = 0.6; // s, wobble-then-fade duration after the hand releases
 
 // Inflation
 const SPAWN_RADIUS  = 14;  // px, bubble size the moment a pinch begins
@@ -99,6 +120,11 @@ const SWAY_AMOUNT = 22;  // px of horizontal sway
 const SWAY_FREQ = 1.6;   // sway oscillations per second-ish
 
 const SHOW_HAND_MARKERS = false; // hand-tracking debug dots
+
+// Performance: the soap-film shader is expensive per pixel, so the WebGL
+// layer renders below full Retina resolution and adapts to keep frames smooth.
+const GL_MAX_PIXEL_RATIO = 1.0; // GL pixels per CSS px when running fast (Retina native = 2)
+const GL_MIN_PIXEL_RATIO = 0.5; // floor the adaptive scaler can drop to when frames get slow
 
 // Birth: pinch-off snap when the bubble is released
 const SNAP_INTENSITY = 0.07; // 0 = detaches with no stretch … 0.35 = cartoonish
@@ -129,13 +155,38 @@ function setStatus(msg, cls) {
   status.className = cls || '';
 }
 
+let glPixelRatio = Math.min(GL_MAX_PIXEL_RATIO, window.devicePixelRatio || 1);
+
+function resizeGLCanvas() {
+  glCanvas.width = Math.max(1, Math.round(window.innerWidth * glPixelRatio));
+  glCanvas.height = Math.max(1, Math.round(window.innerHeight * glPixelRatio));
+}
+
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   canvas.width = window.innerWidth * dpr;
   canvas.height = window.innerHeight * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  glCanvas.width = window.innerWidth * dpr;
-  glCanvas.height = window.innerHeight * dpr;
+  glPixelRatio = Math.min(glPixelRatio, dpr);
+  resizeGLCanvas();
+}
+
+// Adaptive GL resolution: drop it while frames are slow, creep back up
+// when there's headroom. Only judged while something is actually drawn.
+let frameMsAvg = 16;
+let lastScaleChange = 0;
+function adaptGLResolution(frameMs, nowMs, busy) {
+  frameMsAvg = frameMsAvg * 0.9 + frameMs * 0.1;
+  if (!busy || nowMs - lastScaleChange < 800) return;
+  const maxRatio = Math.min(GL_MAX_PIXEL_RATIO, window.devicePixelRatio || 1);
+  let next = glPixelRatio;
+  if (frameMsAvg > 22) next = Math.max(GL_MIN_PIXEL_RATIO, glPixelRatio - 0.1);
+  else if (frameMsAvg < 15) next = Math.min(maxRatio, glPixelRatio + 0.05);
+  if (Math.abs(next - glPixelRatio) > 1e-3) {
+    glPixelRatio = next;
+    lastScaleChange = nowMs;
+    resizeGLCanvas();
+  }
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
@@ -196,49 +247,32 @@ function hslToRgb(h, s, l) {
 // fake-HDR reflections, with the webcam video as the environment.
 const QUAD_MARGIN = 1.4; // quad half-size in radii: headroom for wobble + snap
 
+// Shared by both the bubble and sheet programs — just maps a unit quad
+// corner around a center by a (possibly non-uniform) half-extent.
 const VERT_SRC = `
 attribute vec2 aCorner;
 uniform vec2 uRes;
 uniform vec2 uCenter;   // device px, y measured down from the top
-uniform float uExtent;  // half-size of the quad in device px
+uniform vec2 uExtent;   // half-size of the quad in device px, x/y
 void main() {
   vec2 px = uCenter + aCorner * uExtent;
   gl_Position = vec4(px.x / uRes.x * 2.0 - 1.0, 1.0 - px.y / uRes.y * 2.0, 0.0, 1.0);
 }`;
 
-const FRAG_SRC = `
+// =====================================================================
+// SHARED THIN-FILM MATERIAL — ported from Matteo Mannino's soap bubble
+// shader (https://www.shadertoy.com/view/XtKyRK, CC BY-NC 4.0). Both the
+// sphere bubbles and the sheet below feed the exact same functions here;
+// only the *geometry* supplying their (raydir, normal, filmwidth) differs.
+// =====================================================================
+const MATERIAL_GLSL = `
 precision highp float;
 uniform vec2  uRes;
+uniform vec2  uPxScale; // full-res device px per GL framebuffer px (x, y)
 uniform float uTime;
 uniform sampler2D uEnv; // webcam frame — stands in for his cubemap iChannel0
 uniform vec2  uEnvA;    // screen px -> video uv (cover crop + selfie mirror)
 uniform vec2  uEnvB;
-uniform vec2  uCenter;  // bubble centre, device px, y down
-uniform float uRadius;  // bubble radius, device px
-uniform float uStretch; // pinch-off birth stretch
-uniform vec2  uAxis;    // (cos, sin) of the release axis
-uniform vec3  uSeed;    // per-bubble randomness
-uniform float uRimSat;    // rim colour saturation (1 = his full rainbow)
-uniform float uRimBright; // rim brightness lift (>1 = luminous pastel)
-uniform float uJitter;  // scales his 6-sphere surface wobble
-uniform float uSquish;  // contact flattening strength
-uniform vec3  uContacts[3];
-uniform int   uNumContacts;
-uniform vec3  uTint;         // per-bubble pastel colour
-uniform float uTintStrength; // whisper-faint wash, mostly at the rim
-uniform float uRefract;      // transmitted-light lens strength
-uniform float uMotionWarp;   // motion-drag distortion strength
-uniform vec2  uVel;          // bubble velocity, device px/s (y down)
-uniform float uThickMin; // his minfilmwidth (nm)
-uniform float uThickMax; // his maxfilmwidth (nm)
-
-// =====================================================================
-// PHYSICALLY-BASED REAL-TIME SOAP BUBBLE — Matteo Mannino
-// https://www.shadertoy.com/view/XtKyRK   (CC BY-NC 4.0)
-// Ported near-verbatim. Substitutions are marked [PORT]:
-//   iChannel0 cubemap -> webcam video plane, iChannel1 noise texture ->
-//   procedural value noise, iTime -> uTime, one fixed camera per bubble.
-// =====================================================================
 
 #define hdrfunc(x) (exp(1.2*(x))-1.0)
 #define whitesatval hdrfunc(1.0)
@@ -246,17 +280,7 @@ uniform float uThickMax; // his maxfilmwidth (nm)
 // SOAP REFRACTION VARS
 const float R_0 = 0.0278;
 const float nu = 1.4;
-const float varfilmwidth = 20.0;
-
-// SOAP BUBBLE GEOMETRY VARS
 const float PI = 3.141592653589793;
-const float RADIUS = 0.8;
-const float MAX_DEPTH = 9999999.0;
-const float THRESH_DEPTH = 0.05;
-const float DX = 0.10;
-const float VX = 0.04;
-const float sDX = 0.01;
-const float sVX = 0.04;
 
 // TRANSFORMS FOR RGB-to-SPECTRUM-FILTER-SPECTRUM-to-RGB
 mat3 sparsespfiltconst;
@@ -296,7 +320,8 @@ float fBm(vec3 p) {
   return v;
 }
 
-// 1 level of warp noise for micro waves on bubble surface
+// 1 level of warp noise for micro waves — reused for bubble surface
+// jitter and, with far larger amplitude, sheet fold turbulence.
 float warpnoise3(vec3 p) {
   const float c1 = 0.06;
   const float tc = 0.05;
@@ -355,22 +380,6 @@ vec4 sp_spectral_filter(vec4 col, float filmwidth, float cosi) {
   return retcol;
 }
 
-// Ray-sphere intersection. Returns both front and backside hit
-vec2 sphere(vec3 raydir, vec3 offset, vec4 sparams) {
-  vec3 tcenter = sparams.xyz - offset;
-  float c = dot(tcenter, tcenter) - sparams.w * sparams.w;
-  float b = 2.0 * dot(-tcenter, raydir);
-  float det = b * b - 4.0 * c;
-  vec2 hits = vec2(-1.0, -1.0);
-  if (det > 0.0) {
-    float t1 = 0.5 * (-b + sqrt(det));
-    float t2 = 0.5 * (-b - sqrt(det));
-    if (t1 < t2) { hits = vec2(t1, t2); }
-    else { hits = vec2(t2, t1); }
-  }
-  return hits;
-}
-
 vec3 reflected(vec3 raydir, vec3 normal) {
   return raydir - 2.0 * dot(raydir, normal) * normal;
 }
@@ -382,15 +391,6 @@ float fresnel_schlick(vec3 raydir, vec3 normal) {
 
 vec2 envUV(vec2 px) {
   return clamp(px * uEnvA + uEnvB, 0.0, 1.0);
-}
-
-// [PORT] his background() sampled a cubemap; here a world ray is
-// projected onto the webcam plane. Primary rays land exactly on their
-// own pixel, so the film stays seamless over the live video.
-vec4 background(vec3 raydir) {
-  float zz = max(abs(raydir.z), 0.35);
-  vec2 px = uCenter + vec2(raydir.x, -raydir.y) / zz * (uRadius / 0.6305);
-  return vec4(texture2D(uEnv, envUV(px)).rgb, 1.0);
 }
 
 vec4 fakehdr(vec4 col) {
@@ -411,6 +411,69 @@ vec4 invfakehdr(vec4 hdrcol) {
   ihdrcol.rgb = pow((tonescale / max(lum, 1e-5)) * hdrcol.rgb, vec3(1.0 / 2.2));
   ihdrcol.a = 1.0;
   return ihdrcol;
+}
+`; // end MATERIAL_GLSL
+
+// =====================================================================
+// BUBBLE GEOMETRY — Mannino's 6-sphere raytrace, near-verbatim. [PORT]
+// substitutions: iChannel0 cubemap -> webcam video plane, iChannel1
+// noise texture -> procedural value noise, iTime -> uTime, one fixed
+// pinhole camera per bubble.
+// =====================================================================
+const BUBBLE_MAIN_GLSL = `
+uniform vec2  uCenter;  // bubble centre, device px, y down
+uniform float uRadius;  // bubble radius, device px
+uniform float uStretch; // pinch-off birth stretch
+uniform vec2  uAxis;    // (cos, sin) of the release axis
+uniform vec3  uSeed;    // per-bubble randomness
+uniform float uRimSat;    // rim colour saturation (1 = his full rainbow)
+uniform float uRimBright; // rim brightness lift (>1 = luminous pastel)
+uniform float uJitter;  // scales his 6-sphere surface wobble
+uniform float uSquish;  // contact flattening strength
+uniform vec3  uContacts[3];
+uniform int   uNumContacts;
+uniform vec3  uTint;         // per-bubble pastel colour
+uniform float uTintStrength; // whisper-faint wash, mostly at the rim
+uniform float uRefract;      // transmitted-light lens strength
+uniform float uMotionWarp;   // motion-drag distortion strength
+uniform vec2  uVel;          // bubble velocity, device px/s (y down)
+uniform float uThickMin; // his minfilmwidth (nm)
+uniform float uThickMax; // his maxfilmwidth (nm)
+
+const float varfilmwidth = 20.0;
+
+// SOAP BUBBLE GEOMETRY VARS
+const float RADIUS = 0.8;
+const float MAX_DEPTH = 9999999.0;
+const float THRESH_DEPTH = 0.05;
+const float DX = 0.10;
+const float VX = 0.04;
+const float sDX = 0.01;
+const float sVX = 0.04;
+
+// Ray-sphere intersection. Returns both front and backside hit
+vec2 sphere(vec3 raydir, vec3 offset, vec4 sparams) {
+  vec3 tcenter = sparams.xyz - offset;
+  float c = dot(tcenter, tcenter) - sparams.w * sparams.w;
+  float b = 2.0 * dot(-tcenter, raydir);
+  float det = b * b - 4.0 * c;
+  vec2 hits = vec2(-1.0, -1.0);
+  if (det > 0.0) {
+    float t1 = 0.5 * (-b + sqrt(det));
+    float t2 = 0.5 * (-b - sqrt(det));
+    if (t1 < t2) { hits = vec2(t1, t2); }
+    else { hits = vec2(t2, t1); }
+  }
+  return hits;
+}
+
+// [PORT] his background() sampled a cubemap; here a world ray is
+// projected onto the webcam plane. Primary rays land exactly on their
+// own pixel, so the film stays seamless over the live video.
+vec4 background(vec3 raydir) {
+  float zz = max(abs(raydir.z), 0.35);
+  vec2 px = uCenter + vec2(raydir.x, -raydir.y) / zz * (uRadius / 0.6305);
+  return vec4(texture2D(uEnv, envUV(px)).rgb, 1.0);
 }
 
 // Intersects all spheres and interpolates all points close to the hits.
@@ -524,10 +587,8 @@ mat4 scene(vec3 raydir, vec3 offset, float time) {
 }
 
 void main() {
-  initialize_sparse_spectral_transforms();
-
   // ---- adapter: this quad pixel -> his per-bubble pinhole camera -----
-  vec2 fragpx = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+  vec2 fragpx = vec2(gl_FragCoord.x * uPxScale.x, uRes.y - gl_FragCoord.y * uPxScale.y);
   vec2 lq = (fragpx - uCenter) / uRadius; // bubble radii, y down
 
   // our pinch-off birth stretch, undone around the release axis
@@ -554,6 +615,10 @@ void main() {
   vec2 lqd = vec2(pr.x * uAxis.x - pr.y * uAxis.y,
                   pr.x * uAxis.y + pr.y * uAxis.x);
 
+  // Cheap reject: the quad's corners lie well outside the (jittered)
+  // silhouette, so skip the raytrace there entirely.
+  if (dot(lqd, lqd) > 1.35 * 1.35) discard;
+
   // his camera: sphere of RADIUS 0.8 at the origin, eye at z = -1.5;
   // 0.6305 = tan(asin(0.8/1.5)) puts his silhouette exactly at |lq| = 1
   vec2 offset = vec2(lqd.x, -lqd.y) * 0.6305; // his world is y-up
@@ -570,6 +635,8 @@ void main() {
                           -dot(scenenorms[0].xyz, raydir));
 
   if (mask <= 0.0) discard;
+
+  initialize_sparse_spectral_transforms();
 
   // Transmitted view: bend the backdrop sample by the film's curvature —
   // near zero at the centre, stronger toward the limb — and drag it
@@ -620,10 +687,160 @@ void main() {
   col += uTint * uTintStrength * (0.35 + 0.65 * rimBand);
 
   gl_FragColor = vec4(col * mask, mask); // premultiplied alpha
-}`;
+}`; // end BUBBLE_MAIN_GLSL
+
+const FRAG_SRC = MATERIAL_GLSL + BUBBLE_MAIN_GLSL;
+
+// =====================================================================
+// SHEET GEOMETRY — a heightfield ribbon trailing the dragging hand,
+// instead of a raytraced sphere. Feeds the exact same material
+// functions above (fresnel_schlick / sp_spectral_filter / reflected)
+// with a normal derived from the undulating height field instead of a
+// sphere intersection.
+// =====================================================================
+const SHEET_MAX_PTS = SHEET_MAX_POINTS; // JS constant, defined in the tuning section above
+
+const SHEET_MAIN_GLSL = `
+uniform vec2  uCenter;    // bounding-quad centre, device px
+uniform vec2  uSpine[${SHEET_MAX_PTS}]; // trail polyline, head (hand) first, device px
+uniform float uSpineArc[${SHEET_MAX_PTS}]; // cumulative arc length at each point, device px
+uniform int   uSpineCount;
+uniform float uSpineLength; // total arc length, device px
+uniform float uWidth;       // ribbon half-width, device px
+uniform float uRippleAmount; // px, base undulation amplitude
+uniform float uRippleFreq;   // spatial frequency multiplier of the folds
+uniform float uRippleSpeed;  // rad/s, how fast the folds roll
+uniform float uBillow;       // extra amplitude growth from head to tail
+uniform float uInterference; // thickness-variation intensity — big = wilder swirl
+uniform float uAlpha;        // release/dissipate fade, 1 = fully visible
+uniform float uBurst;        // 0..1 turbulence boost right before dissipating
+uniform vec3  uSeed;         // per-sheet randomness
+
+// Approximate reflection sample: nudge the video lookup toward the
+// reflected ray, same spirit as the bubble's background() but without a
+// per-bubble radius to scale by (the sheet isn't a fixed-size object).
+vec4 sheetReflEnv(vec3 rvec, vec2 fragpx) {
+  vec2 px = fragpx + vec2(rvec.x, -rvec.y) * 260.0;
+  return vec4(texture2D(uEnv, envUV(px)).rgb, 1.0);
+}
+
+// Layered waves + the shared fBm noise, in local ribbon coordinates
+// (A = distance along the trail, B = distance across its width).
+float sheetHeight(float A, float B, float amp, float t) {
+  return amp * (
+      0.55 * sin(A * uRippleFreq * 0.010 + t * uRippleSpeed + uSeed.x * 20.0)
+    + 0.30 * sin(B * 0.020 + A * 0.006 - t * uRippleSpeed * 1.4 + uSeed.y * 20.0)
+    + 0.35 * fBm(vec3(A * 0.012, B * 0.02, t * 0.25 + uSeed.z * 10.0 + uBurst * 3.0))
+  );
+}
+
+void main() {
+  vec2 fragpx = vec2(gl_FragCoord.x * uPxScale.x, uRes.y - gl_FragCoord.y * uPxScale.y);
+
+  // Project this fragment onto the nearest segment of the trail
+  // polyline: 'a' = arc-length distance from the hand, 'b' = signed
+  // perpendicular offset (the ribbon's width axis), plus the local
+  // tangent direction for orienting the fold waves.
+  float bestDist = 1e9;
+  float a = 0.0, b = 0.0;
+  vec2 tangent = vec2(1.0, 0.0);
+  for (int i = 0; i < ${SHEET_MAX_PTS} - 1; i++) {
+    if (i >= uSpineCount - 1) break;
+    vec2 p0 = uSpine[i];
+    vec2 p1 = uSpine[i + 1];
+    vec2 seg = p1 - p0;
+    float segLen = length(seg);
+    if (segLen < 1e-4) continue;
+    vec2 dir = seg / segLen;
+    float segT = clamp(dot(fragpx - p0, dir), 0.0, segLen);
+    vec2 closest = p0 + dir * segT;
+    float d = length(fragpx - closest);
+    if (d < bestDist) {
+      bestDist = d;
+      a = uSpineArc[i] + segT;
+      vec2 perp = vec2(-dir.y, dir.x);
+      b = dot(fragpx - closest, perp);
+      tangent = dir;
+    }
+  }
+
+  float u = clamp(a / max(uSpineLength, 1.0), 0.0, 1.0);
+  float v = b / max(uWidth, 1.0);
+
+  // Soft falloff across the width and toward the trailing tail.
+  float edge = 1.0 - smoothstep(0.7, 1.0, abs(v));
+  float tailFade = 1.0 - smoothstep(0.82, 1.0, u);
+  float mask = edge * tailFade * uAlpha;
+  if (mask <= 0.002) discard;
+
+  initialize_sparse_spectral_transforms();
+
+  // ---- undulating height field: taut near the hand, billowing toward
+  // the tail, plus organic noise for irregular folds and a turbulence
+  // burst while dissipating ----
+  float lagAmp = (0.15 + 0.85 * u) * uBillow;
+  float amp = uRippleAmount * lagAmp * (1.0 + uBurst * 1.6);
+  float t = uTime;
+  float eps = 6.0;
+
+  float h  = sheetHeight(a, b, amp, t);
+  float hA = sheetHeight(a + eps, b, amp, t);
+  float hB = sheetHeight(a, b + eps, amp, t);
+  float slopeA = (hA - h) / eps;
+  float slopeB = (hB - h) / eps;
+
+  // Rotate the local (tangent, perp) slope into screen-aligned xy for a
+  // proper 3D normal — this is what makes the folds catch light
+  // differently instead of reading as a flat painted gradient.
+  vec2 perp = vec2(-tangent.y, tangent.x);
+  vec2 nxy = -slopeA * tangent - slopeB * perp;
+  vec3 normal = normalize(vec3(nxy, 1.0));
+
+  // Simple fixed pinhole camera, same trick as the bubble's, recentred
+  // on the sheet's own bounding box.
+  vec2 offset = fragpx - uCenter;
+  vec3 raydir = normalize(vec3(offset / 900.0, 1.0));
+
+  vec3 rvec = reflected(raydir, normal);
+  float R = fresnel_schlick(raydir, normal);
+
+  // Big sheets swing through a much wider thickness range than small
+  // bubbles — that's what produces the broad swirling rainbow bands.
+  // Thickness rides the same height field so bands visibly follow the
+  // folds, plus its own noise so it doesn't look locked to the waves.
+  float filmwidth = 420.0 + uInterference * (
+      420.0 * fBm(vec3(a * 0.010, b * 0.020, t * 0.15 + uSeed.x * 5.0))
+    + 260.0 * h / max(amp, 1e-4)
+  );
+  filmwidth = clamp(filmwidth, 80.0, 1700.0);
+
+  vec4 filt = sp_spectral_filter(fakehdr(sheetReflEnv(rvec, fragpx)), filmwidth, dot(normal, raydir));
+  vec3 reflhdr = R * filt.xyz;
+  float trans = 1.0 - R;
+  vec3 shiny = reflhdr / (1.0 + reflhdr);
+
+  // Refracted background, bent by the local slope — same idea as the
+  // bubble's transmitted-view bend.
+  vec2 bendpx = nxy * 0.4;
+  vec3 bg;
+  bg.r = texture2D(uEnv, envUV(fragpx - bendpx * 0.96)).r;
+  bg.g = texture2D(uEnv, envUV(fragpx - bendpx)).g;
+  bg.b = texture2D(uEnv, envUV(fragpx - bendpx * 1.04)).b;
+
+  vec3 col = bg * mix(1.0, trans, 0.55) + shiny;
+
+  gl_FragColor = vec4(col * mask, mask); // premultiplied alpha
+}`; // end SHEET_MAIN_GLSL
+
+const SHEET_FRAG_SRC = MATERIAL_GLSL + SHEET_MAIN_GLSL;
 
 let glProgram = null;
 let glU = null;
+let glACorner = null;
+let sheetProgram = null;
+let sheetU = null;
+let sheetACorner = null;
+let quadBuffer = null;
 let videoTex = null;
 
 function initGL() {
@@ -638,35 +855,50 @@ function initGL() {
     }
     return s;
   };
-  const vs = mk(gl.VERTEX_SHADER, VERT_SRC);
-  const fs = mk(gl.FRAGMENT_SHADER, FRAG_SRC);
-  if (!vs || !fs) return false;
-  glProgram = gl.createProgram();
-  gl.attachShader(glProgram, vs);
-  gl.attachShader(glProgram, fs);
-  gl.linkProgram(glProgram);
-  if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
-    console.error('program link:', gl.getProgramInfoLog(glProgram));
-    glProgram = null;
-    return false;
-  }
-  gl.useProgram(glProgram);
+  // Both programs share VERT_SRC verbatim — only the fragment shader's
+  // geometry section differs; the material functions are identical text.
+  const link = (fragSrc) => {
+    const vs = mk(gl.VERTEX_SHADER, VERT_SRC);
+    const fs = mk(gl.FRAGMENT_SHADER, fragSrc);
+    if (!vs || !fs) return null;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error('program link:', gl.getProgramInfoLog(prog));
+      return null;
+    }
+    return prog;
+  };
 
-  const quad = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  glProgram = link(FRAG_SRC);
+  sheetProgram = link(SHEET_FRAG_SRC);
+  if (!glProgram || !sheetProgram) return false;
+
+  quadBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
   gl.bufferData(gl.ARRAY_BUFFER,
     new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-  const aCorner = gl.getAttribLocation(glProgram, 'aCorner');
-  gl.enableVertexAttribArray(aCorner);
-  gl.vertexAttribPointer(aCorner, 2, gl.FLOAT, false, 0, 0);
+
+  glACorner = gl.getAttribLocation(glProgram, 'aCorner');
+  sheetACorner = gl.getAttribLocation(sheetProgram, 'aCorner');
 
   glU = {};
-  for (const name of ['uRes', 'uTime', 'uEnv', 'uEnvA', 'uEnvB', 'uCenter',
+  for (const name of ['uRes', 'uPxScale', 'uTime', 'uEnv', 'uEnvA', 'uEnvB', 'uCenter',
     'uRadius', 'uExtent', 'uStretch', 'uAxis', 'uSeed', 'uRimSat',
     'uRimBright', 'uJitter', 'uSquish', 'uContacts', 'uNumContacts',
     'uThickMin', 'uThickMax', 'uTint', 'uTintStrength', 'uRefract',
     'uMotionWarp', 'uVel']) {
     glU[name] = gl.getUniformLocation(glProgram, name);
+  }
+
+  sheetU = {};
+  for (const name of ['uRes', 'uPxScale', 'uTime', 'uEnv', 'uEnvA', 'uEnvB', 'uCenter',
+    'uExtent', 'uSpine', 'uSpineArc', 'uSpineCount', 'uSpineLength',
+    'uWidth', 'uRippleAmount', 'uRippleFreq', 'uRippleSpeed', 'uBillow',
+    'uInterference', 'uAlpha', 'uBurst', 'uSeed']) {
+    sheetU[name] = gl.getUniformLocation(sheetProgram, name);
   }
 
   videoTex = gl.createTexture();
@@ -681,112 +913,215 @@ function initGL() {
   return true;
 }
 
+let glWasEmpty = false;
+let lastUploadedVideoTime = -1;
+
 function renderGL(now, dt) {
   if (!glProgram) return;
-  const w = glCanvas.width;
-  const h = glCanvas.height;
-  gl.viewport(0, 0, w, h);
+  // All positions/sizes stay in full-res device px (the space the shaders
+  // were tuned in); uPxScale maps the smaller framebuffer back onto it.
+  const dpr = window.devicePixelRatio || 1;
+  const w = window.innerWidth * dpr;
+  const h = window.innerHeight * dpr;
+  const pxScaleX = w / glCanvas.width;
+  const pxScaleY = h / glCanvas.height;
+  const empty = (!bubbles.length && !sheets.length) || video.readyState < 2;
+  if (empty && glWasEmpty) return; // already cleared, nothing new to draw
+  glWasEmpty = empty;
+  gl.viewport(0, 0, glCanvas.width, glCanvas.height);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
-  if (!bubbles.length || video.readyState < 2) return;
+  if (empty) return;
 
-  gl.useProgram(glProgram);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-  gl.uniform1i(glU.uEnv, 0);
+  if (video.currentTime !== lastUploadedVideoTime) {
+    lastUploadedVideoTime = video.currentTime;
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  }
 
-  // Screen px -> video uv, replicating object-fit: cover + the CSS mirror
+  // Screen px -> video uv, replicating object-fit: cover + the CSS mirror.
+  // Shared by both programs (uEnvA/uEnvB have separate uniform locations
+  // per-program but the same values).
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   const scale = Math.max(w / vw, h / vh);
   const offX = (w - vw * scale) / 2;
   const offY = (h - vh * scale) / 2;
-  gl.uniform2f(glU.uEnvA, -1 / (vw * scale), 1 / (vh * scale));
-  gl.uniform2f(glU.uEnvB, (offX + vw * scale) / (vw * scale), -offY / (vh * scale));
+  const envA0 = -1 / (vw * scale), envA1 = 1 / (vh * scale);
+  const envB0 = (offX + vw * scale) / (vw * scale), envB1 = -offY / (vh * scale);
 
-  gl.uniform2f(glU.uRes, w, h);
-  gl.uniform1f(glU.uTime, now);
-  gl.uniform1f(glU.uRimSat, RIM_SATURATION);
-  gl.uniform1f(glU.uRimBright, RIM_BRIGHTNESS);
-  gl.uniform1f(glU.uJitter, SURFACE_JITTER);
-  gl.uniform1f(glU.uSquish, CONTACT_SQUISH);
-  gl.uniform1f(glU.uThickMin, FILM_THICKNESS_MIN);
-  gl.uniform1f(glU.uThickMax, FILM_THICKNESS_MAX);
-  gl.uniform1f(glU.uTintStrength, TINT_STRENGTH);
-  gl.uniform1f(glU.uRefract, REFRACTION_AMOUNT);
-  gl.uniform1f(glU.uMotionWarp, MOTION_DISTORTION);
+  if (bubbles.length) {
+    gl.useProgram(glProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(glACorner);
+    gl.vertexAttribPointer(glACorner, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform1i(glU.uEnv, 0);
+    gl.uniform2f(glU.uEnvA, envA0, envA1);
+    gl.uniform2f(glU.uEnvB, envB0, envB1);
+    gl.uniform2f(glU.uRes, w, h);
+    gl.uniform2f(glU.uPxScale, pxScaleX, pxScaleY);
+    gl.uniform1f(glU.uTime, now);
+    gl.uniform1f(glU.uRimSat, RIM_SATURATION);
+    gl.uniform1f(glU.uRimBright, RIM_BRIGHTNESS);
+    gl.uniform1f(glU.uJitter, SURFACE_JITTER);
+    gl.uniform1f(glU.uSquish, CONTACT_SQUISH);
+    gl.uniform1f(glU.uThickMin, FILM_THICKNESS_MIN);
+    gl.uniform1f(glU.uThickMax, FILM_THICKNESS_MAX);
+    gl.uniform1f(glU.uTintStrength, TINT_STRENGTH);
+    gl.uniform1f(glU.uRefract, REFRACTION_AMOUNT);
+    gl.uniform1f(glU.uMotionWarp, MOTION_DISTORTION);
 
-  // Smoothed per-bubble velocity feeds the motion-drag distortion
-  if (dt > 0) {
-    for (const b of bubbles) {
-      b.vx = b.vx * 0.8 + ((b.x - b.lx) / dt) * 0.2;
-      b.vy = b.vy * 0.8 + ((b.y - b.ly) / dt) * 0.2;
-      b.lx = b.x; b.ly = b.y;
+    // Smoothed per-bubble velocity feeds the motion-drag distortion
+    if (dt > 0) {
+      for (const b of bubbles) {
+        b.vx = b.vx * 0.8 + ((b.x - b.lx) / dt) * 0.2;
+        b.vy = b.vy * 0.8 + ((b.y - b.ly) / dt) * 0.2;
+        b.lx = b.x; b.ly = b.y;
+      }
+    }
+
+    const deforms = bubbles.map(b => bubbleDeform(b, now));
+    const contactArr = new Float32Array(9);
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      const { scaleIn, stretch } = deforms[i];
+      const r = b.r * scaleIn * dpr;
+      if (r < 1) continue;
+
+      // Touching neighbours: direction + shared-wall distance (in radii).
+      // The wall sits on the radical plane between the two spheres; the
+      // deepest three contacts are sent to the shader, rotated into this
+      // bubble's circle space so they line up with its outline maths.
+      const rB = b.r * scaleIn;
+      const contacts = [];
+      for (let j = 0; j < bubbles.length; j++) {
+        if (j === i) continue;
+        const o = bubbles[j];
+        const rO = o.r * deforms[j].scaleIn;
+        const dx = o.x - b.x, dy = o.y - b.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 1 || d >= rB + rO) continue;
+        let wall = (d * d + rB * rB - rO * rO) / (2 * d);
+        wall = Math.max(0.25 * rB, Math.min(wall, rB));
+        contacts.push({ depth: rB + rO - d, x: dx / d, y: dy / d, wall: wall / rB });
+      }
+      contacts.sort((p, q) => q.depth - p.depth);
+      const nContacts = Math.min(3, contacts.length);
+      const cosA = Math.cos(b.releaseAngle);
+      const sinA = Math.sin(b.releaseAngle);
+      contactArr.fill(0);
+      for (let k = 0; k < nContacts; k++) {
+        const c = contacts[k];
+        contactArr[k * 3]     =  c.x * cosA + c.y * sinA;
+        contactArr[k * 3 + 1] = -c.x * sinA + c.y * cosA;
+        contactArr[k * 3 + 2] = c.wall;
+      }
+
+      const ext = r * QUAD_MARGIN * (1 + Math.abs(stretch));
+      gl.uniform2f(glU.uCenter, b.x * dpr, b.y * dpr);
+      gl.uniform1f(glU.uRadius, r);
+      gl.uniform2f(glU.uExtent, ext, ext);
+      gl.uniform1f(glU.uStretch, stretch);
+      gl.uniform2f(glU.uAxis, cosA, sinA);
+      gl.uniform3f(glU.uSeed, b.seed[0], b.seed[1], b.seed[2]);
+      gl.uniform3f(glU.uTint, b.tint[0], b.tint[1], b.tint[2]);
+      gl.uniform2f(glU.uVel, b.vx * dpr, b.vy * dpr);
+      gl.uniform3fv(glU.uContacts, contactArr);
+      gl.uniform1i(glU.uNumContacts, nContacts);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
   }
 
-  const dpr = window.devicePixelRatio || 1;
-  const deforms = bubbles.map(b => bubbleDeform(b, now));
-  const contactArr = new Float32Array(9);
-  for (let i = 0; i < bubbles.length; i++) {
-    const b = bubbles[i];
-    const { scaleIn, stretch } = deforms[i];
-    const r = b.r * scaleIn * dpr;
-    if (r < 1) continue;
+  if (sheets.length) {
+    gl.useProgram(sheetProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(sheetACorner);
+    gl.vertexAttribPointer(sheetACorner, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform1i(sheetU.uEnv, 0);
+    gl.uniform2f(sheetU.uEnvA, envA0, envA1);
+    gl.uniform2f(sheetU.uEnvB, envB0, envB1);
+    gl.uniform2f(sheetU.uRes, w, h);
+    gl.uniform2f(sheetU.uPxScale, pxScaleX, pxScaleY);
+    gl.uniform1f(sheetU.uTime, now);
 
-    // Touching neighbours: direction + shared-wall distance (in radii).
-    // The wall sits on the radical plane between the two spheres; the
-    // deepest three contacts are sent to the shader, rotated into this
-    // bubble's circle space so they line up with its outline maths.
-    const rB = b.r * scaleIn;
-    const contacts = [];
-    for (let j = 0; j < bubbles.length; j++) {
-      if (j === i) continue;
-      const o = bubbles[j];
-      const rO = o.r * deforms[j].scaleIn;
-      const dx = o.x - b.x, dy = o.y - b.y;
-      const d = Math.hypot(dx, dy);
-      if (d < 1 || d >= rB + rO) continue;
-      let wall = (d * d + rB * rB - rO * rO) / (2 * d);
-      wall = Math.max(0.25 * rB, Math.min(wall, rB));
-      contacts.push({ depth: rB + rO - d, x: dx / d, y: dy / d, wall: wall / rB });
-    }
-    contacts.sort((p, q) => q.depth - p.depth);
-    const nContacts = Math.min(3, contacts.length);
-    const cosA = Math.cos(b.releaseAngle);
-    const sinA = Math.sin(b.releaseAngle);
-    contactArr.fill(0);
-    for (let k = 0; k < nContacts; k++) {
-      const c = contacts[k];
-      contactArr[k * 3]     =  c.x * cosA + c.y * sinA;
-      contactArr[k * 3 + 1] = -c.x * sinA + c.y * cosA;
-      contactArr[k * 3 + 2] = c.wall;
-    }
+    const spineArr = new Float32Array(SHEET_MAX_POINTS * 2);
+    const arcArr = new Float32Array(SHEET_MAX_POINTS);
 
-    gl.uniform2f(glU.uCenter, b.x * dpr, b.y * dpr);
-    gl.uniform1f(glU.uRadius, r);
-    gl.uniform1f(glU.uExtent, r * QUAD_MARGIN * (1 + Math.abs(stretch)));
-    gl.uniform1f(glU.uStretch, stretch);
-    gl.uniform2f(glU.uAxis, cosA, sinA);
-    gl.uniform3f(glU.uSeed, b.seed[0], b.seed[1], b.seed[2]);
-    gl.uniform3f(glU.uTint, b.tint[0], b.tint[1], b.tint[2]);
-    gl.uniform2f(glU.uVel, b.vx * dpr, b.vy * dpr);
-    gl.uniform3fv(glU.uContacts, contactArr);
-    gl.uniform1i(glU.uNumContacts, nContacts);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    for (const s of sheets) {
+      if (s.points.length < 2) continue;
+
+      // Bounding box of the trail, padded for ripple + width headroom,
+      // in screen px — the quad this sheet's fragment shader runs over.
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const p of s.points) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+      }
+      const pad = SHEET_WIDTH + SHEET_RIPPLE_AMOUNT * (1 + SHEET_BILLOW) + 40;
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const ex = (maxX - minX) / 2 + pad, ey = (maxY - minY) / 2 + pad;
+
+      // Spine polyline + cumulative arc length, head (hand) first.
+      let arc = 0;
+      spineArr[0] = s.points[0].x * dpr;
+      spineArr[1] = s.points[0].y * dpr;
+      arcArr[0] = 0;
+      for (let i = 1; i < s.points.length; i++) {
+        arc += dist(s.points[i - 1], s.points[i]);
+        spineArr[i * 2] = s.points[i].x * dpr;
+        spineArr[i * 2 + 1] = s.points[i].y * dpr;
+        arcArr[i] = arc * dpr;
+      }
+      // Pad unused slots by repeating the last point, so the shader's
+      // trailing segments collapse to zero length instead of reading stale data.
+      for (let i = s.points.length; i < SHEET_MAX_POINTS; i++) {
+        spineArr[i * 2] = spineArr[(s.points.length - 1) * 2];
+        spineArr[i * 2 + 1] = spineArr[(s.points.length - 1) * 2 + 1];
+        arcArr[i] = arc * dpr;
+      }
+
+      // Release: freeze the trail, fade alpha, and inject a brief
+      // turbulence burst mid-fade for a "pop" instead of a clean vanish.
+      let alpha = 1, burst = 0;
+      if (s.releasing) {
+        const age = now - s.releaseTime;
+        const k = Math.min(1, age / SHEET_DISSIPATE_TIME);
+        alpha = 1 - k;
+        burst = Math.sin(k * Math.PI);
+      }
+
+      gl.uniform2f(sheetU.uCenter, cx * dpr, cy * dpr);
+      gl.uniform2f(sheetU.uExtent, ex * dpr, ey * dpr);
+      gl.uniform2fv(sheetU.uSpine, spineArr);
+      gl.uniform1fv(sheetU.uSpineArc, arcArr);
+      gl.uniform1i(sheetU.uSpineCount, s.points.length);
+      gl.uniform1f(sheetU.uSpineLength, Math.max(arc * dpr, 1));
+      gl.uniform1f(sheetU.uWidth, SHEET_WIDTH * dpr);
+      gl.uniform1f(sheetU.uRippleAmount, SHEET_RIPPLE_AMOUNT * dpr);
+      gl.uniform1f(sheetU.uRippleFreq, SHEET_RIPPLE_FREQ);
+      gl.uniform1f(sheetU.uRippleSpeed, SHEET_RIPPLE_SPEED);
+      gl.uniform1f(sheetU.uBillow, SHEET_BILLOW);
+      gl.uniform1f(sheetU.uInterference, SHEET_INTERFERENCE);
+      gl.uniform1f(sheetU.uAlpha, alpha);
+      gl.uniform1f(sheetU.uBurst, burst);
+      gl.uniform3f(sheetU.uSeed, s.seed[0], s.seed[1], s.seed[2]);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
   }
 }
 
 // --- World state ---
 let nextBubbleId = 1;
+let nextSheetId = 1;
 const bubbles = [];   // { id, x, y, r, state: 'growing'|'floating', handIndex, phase, born }
 const particles = []; // { x, y, vx, vy, life, maxLife }
+const sheets = [];     // { id, handIndex, points: [{x,y}] (head/hand first), releasing, releaseTime, seed }
 
 // Per-hand interaction state, indexed by hand slot (0, 1)
 const hands = [
-  { pinching: false, bubbleId: null, insideIds: new Set() },
-  { pinching: false, bubbleId: null, insideIds: new Set() },
+  { pinching: false, bubbleId: null, insideIds: new Set(), wanding: false, sheetId: null },
+  { pinching: false, bubbleId: null, insideIds: new Set(), wanding: false, sheetId: null },
 ];
 
 function spawnBubble(x, y, handIndex) {
@@ -805,6 +1140,57 @@ function spawnBubble(x, y, handIndex) {
   };
   bubbles.push(b);
   return b;
+}
+
+// Starts (or continues) a sheet trailing the given hand. Called every
+// frame the ring/O pose is held; a lag-smoothed "head" eases toward the
+// true hand position, and a new spine point is recorded once it has
+// moved SHEET_POINT_SPACING px — so a fast sweep visibly leaves the
+// membrane behind before it catches up (the "billow" look).
+function updateSheetTrail(hand, handIndex, point, now) {
+  let sheet = sheets.find(s => s.id === hand.sheetId);
+  if (!sheet) {
+    sheet = {
+      id: nextSheetId++,
+      handIndex,
+      points: [{ x: point.x, y: point.y }],
+      releasing: false,
+      releaseTime: 0,
+      seed: [Math.random(), Math.random(), Math.random()],
+      smoothX: point.x, smoothY: point.y, lastT: now,
+    };
+    sheets.push(sheet);
+    hand.sheetId = sheet.id;
+    return;
+  }
+
+  const lagK = 1 - Math.pow(SHEET_LAG, Math.max(1e-3, now - sheet.lastT));
+  sheet.smoothX += (point.x - sheet.smoothX) * lagK;
+  sheet.smoothY += (point.y - sheet.smoothY) * lagK;
+  sheet.lastT = now;
+
+  const head = sheet.points[0];
+  const d = Math.hypot(sheet.smoothX - head.x, sheet.smoothY - head.y);
+  if (d >= SHEET_POINT_SPACING) {
+    sheet.points.unshift({ x: sheet.smoothX, y: sheet.smoothY });
+    if (sheet.points.length > SHEET_MAX_POINTS) sheet.points.length = SHEET_MAX_POINTS;
+  } else {
+    // Keep the very head glued to the smoothed position for a taut,
+    // responsive leading edge between spacing thresholds.
+    head.x = sheet.smoothX;
+    head.y = sheet.smoothY;
+  }
+}
+
+// Pose released or hand vanished: freeze the trail (no more points
+// appended) and let renderGL fade/dissipate it over SHEET_DISSIPATE_TIME.
+function releaseSheet(hand) {
+  const sheet = sheets.find(s => s.id === hand.sheetId);
+  if (sheet) {
+    sheet.releasing = true;
+    sheet.releaseTime = performance.now() / 1000;
+  }
+  hand.sheetId = null;
 }
 
 function popBubble(b) {
@@ -828,6 +1214,7 @@ function popBubble(b) {
 // --- Interaction: consume one detection result ---
 function handleHands(result) {
   const seen = new Set();
+  const now = performance.now() / 1000;
 
   (result?.landmarks || []).forEach((lm, i) => {
     if (i > 1) return;
@@ -836,14 +1223,37 @@ function handleHands(result) {
 
     const thumb = landmarkToScreen(lm[THUMB_TIP]);
     const index = landmarkToScreen(lm[INDEX_TIP]);
+    const middle = landmarkToScreen(lm[MIDDLE_TIP]);
+    const ring = landmarkToScreen(lm[RING_TIP]);
     const span = dist(landmarkToScreen(lm[WRIST]), landmarkToScreen(lm[INDEX_MCP]));
     if (span < 1) return;
 
     const pinchRatio = dist(thumb, index) / span;
     const pinchPoint = { x: (thumb.x + index.x) / 2, y: (thumb.y + index.y) / 2 };
 
+    // Ring/O pose: index, middle, and ring all curled toward the thumb.
+    // Averaging three fingertip gaps (vs. the pinch's one) is what keeps
+    // an ordinary pinch — where the other fingers stay open — from
+    // tripping this.
+    const ringRatio = (dist(thumb, index) + dist(thumb, middle) + dist(thumb, ring)) / (3 * span);
+    const wandPoint = { x: (thumb.x + index.x + middle.x) / 3, y: (thumb.y + index.y + middle.y) / 3 };
+
+    // Wand state machine with hysteresis; mutually exclusive with pinching.
+    if (!hand.pinching) {
+      if (!hand.wanding && ringRatio < RING_START_RATIO) {
+        hand.wanding = true;
+      } else if (hand.wanding && ringRatio > RING_END_RATIO) {
+        hand.wanding = false;
+        releaseSheet(hand);
+      }
+    }
+
+    if (hand.wanding && !hand.pinching) {
+      updateSheetTrail(hand, i, wandPoint, now);
+    }
+
     // Pinch state machine with hysteresis
-    if (!hand.pinching && pinchRatio < PINCH_START_RATIO) {
+    if (!hand.pinching && !hand.wanding && pinchRatio < PINCH_START_RATIO) {
       hand.pinching = true;
       hand.bubbleId = spawnBubble(pinchPoint.x, pinchPoint.y, i).id;
     } else if (hand.pinching && pinchRatio > PINCH_END_RATIO) {
@@ -870,9 +1280,9 @@ function handleHands(result) {
     }
 
     // Pop detection: edge-triggered on fingertip entering a floating bubble.
-    // A pinching hand's fingertip is busy; don't let it pop things.
+    // A pinching or wanding hand's fingertip is busy; don't let it pop things.
     const nowInside = new Set();
-    if (!hand.pinching) {
+    if (!hand.pinching && !hand.wanding) {
       for (const b of bubbles) {
         if (b.state !== 'floating') continue;
         if (dist(index, b) < b.r * POP_RADIUS_SCALE) {
@@ -895,6 +1305,10 @@ function handleHands(result) {
       const b = bubbles.find(b => b.id === hand.bubbleId);
       if (b) { b.state = 'floating'; b.born = performance.now() / 1000; }
       hand.bubbleId = null;
+    }
+    if (hand.wanding) {
+      hand.wanding = false;
+      releaseSheet(hand);
     }
     hand.insideIds.clear();
     hand.landmarks = null;
@@ -923,6 +1337,13 @@ function update(dt, now) {
     p.y += p.vy * dt;
     p.vx *= 0.94;
     p.vy *= 0.94;
+  }
+
+  for (let i = sheets.length - 1; i >= 0; i--) {
+    const s = sheets[i];
+    if (s.releasing && now - s.releaseTime > SHEET_DISSIPATE_TIME) {
+      sheets.splice(i, 1);
+    }
   }
 }
 
@@ -1016,6 +1437,7 @@ function loop(landmarker) {
   update(dt, now);
   renderGL(now, dt);
   draw(now);
+  adaptGLResolution(dt * 1000, nowMs, bubbles.length > 0 || sheets.length > 0);
   requestAnimationFrame(() => loop(landmarker));
 }
 
